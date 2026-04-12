@@ -308,6 +308,70 @@ def register_compat_commands(app: typer.Typer) -> None:
             [f"任务ID: {run_id}", f"已保存: {output}", f"参考图数量: {len(encoded_images)}", f"状态: {_status_cn('success')}"],
         )
 
+    @app.command("upload", help="上传文件到火山引擎 TOS 对象存储。")
+    def upload(
+        ctx: typer.Context,
+        file: Path = typer.Argument(..., help="要上传的本地文件路径。"),
+        bucket: str = typer.Option(None, "--bucket", help="TOS 桶名称（或 CHANGDU_TOS_BUCKET）。"),
+        key: str | None = typer.Option(None, "--key", help="对象Key（默认为文件名）。"),
+        prefix: str = typer.Option("", "--prefix", help="对象Key前缀（如 videos/ep001/）。"),
+        public: bool = typer.Option(True, "--public/--private", help="是否设为公开读。"),
+        ak: str | None = typer.Option(None, "--ak", help="火山引擎 Access Key（或 VOLC_ACCESSKEY）。"),
+        sk: str | None = typer.Option(None, "--sk", help="火山引擎 Secret Key（或 VOLC_SECRETKEY）。"),
+        tos_endpoint: str | None = typer.Option(None, "--tos-endpoint", help="TOS 端点（或 CHANGDU_TOS_ENDPOINT）。"),
+        region: str | None = typer.Option(None, "--region", help="TOS 地域（或 CHANGDU_TOS_REGION）。"),
+    ) -> None:
+        import os
+        from changdu.client.tos_upload import upload_file
+
+        resolved_ak = ak or os.getenv("VOLC_ACCESSKEY") or os.getenv("CHANGDU_TOS_AK")
+        resolved_sk = sk or os.getenv("VOLC_SECRETKEY") or os.getenv("CHANGDU_TOS_SK")
+        resolved_bucket = bucket or os.getenv("CHANGDU_TOS_BUCKET")
+        resolved_endpoint = tos_endpoint or os.getenv("CHANGDU_TOS_ENDPOINT", "tos-cn-beijing.volces.com")
+        resolved_region = region or os.getenv("CHANGDU_TOS_REGION", "cn-beijing")
+
+        if not resolved_ak or not resolved_sk:
+            typer.echo("错误：缺少火山引擎 AK/SK。请设置 VOLC_ACCESSKEY + VOLC_SECRETKEY 环境变量，或通过 --ak/--sk 传入。", err=True)
+            raise typer.Exit(1)
+        if not resolved_bucket:
+            typer.echo("错误：缺少 TOS 桶名。请设置 CHANGDU_TOS_BUCKET 环境变量，或通过 --bucket 传入。", err=True)
+            raise typer.Exit(1)
+
+        obj_key = key if key else (prefix + file.name)
+
+        obj: AppContext = ctx.obj
+        run_id = obj.trajectory_store.create_run("upload")
+
+        try:
+            result = upload_file(
+                file_path=file,
+                bucket=resolved_bucket,
+                key=obj_key,
+                ak=resolved_ak,
+                sk=resolved_sk,
+                endpoint=resolved_endpoint,
+                region=resolved_region,
+                public=public,
+            )
+        except FileNotFoundError as e:
+            typer.echo(f"错误：{e}", err=True)
+            raise typer.Exit(1)
+        except Exception as e:
+            typer.echo(f"上传失败：{e}", err=True)
+            raise typer.Exit(1)
+
+        obj.trajectory_store.append_event(run_id, "uploaded", {
+            "bucket": result.bucket,
+            "key": result.key,
+            "url": result.url,
+            "status_code": result.status_code,
+        })
+        _emit(
+            obj,
+            {"bucket": result.bucket, "key": result.key, "url": result.url, "status": "success"},
+            [f"桶: {result.bucket}", f"Key: {result.key}", f"URL: {result.url}", f"状态: 上传成功"],
+        )
+
     @app.command("examples", help="显示可直接复制的示例命令。")
     def examples() -> None:
         typer.echo("【环境变量配置】")
@@ -329,6 +393,10 @@ def register_compat_commands(app: typer.Typer) -> None:
         typer.echo("")
         typer.echo("【示例4：查询任务状态】")
         typer.echo("changdu query_result --submit_id <任务ID>")
+        typer.echo("")
+        typer.echo("【示例5：上传文件到 TOS】")
+        typer.echo("changdu upload ./out/clip.mp4 --bucket my-bucket --prefix videos/")
+        typer.echo("changdu upload ./out/cat.jpg --bucket my-bucket --public")
 
 
 def _submit_video_compat(
