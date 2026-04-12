@@ -1,91 +1,65 @@
 # changdu
 
-`changdu` is a Python CLI that mirrors Dreamina capability with Volcano Ark models:
+火山方舟 Seedream / Seedance 图像视频生成 CLI。
 
-- Image generation: Seedream 5.0 Lite
-- Video generation: Seedance 2.0
+- 图像生成：Seedream（文生图、图生图）
+- 视频生成：Seedance 2.0（文生视频、多图参考视频）
 
-## Install
+## 安装
 
 ```bash
+# 从 GitHub 安装
+pipx install "changdu @ git+https://github.com/bolecodex/changdu-skills.git#subdirectory=changdu"
+
+# 或本地安装
 cd changdu
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
+pip install .
 ```
 
-## Required Environment
+## 环境变量
 
 ```bash
-export CHANGDU_ARK_API_KEY="your_ark_api_key"
-# optional
+# 必需
+export CHANGDU_ARK_API_KEY="你的火山方舟API Key"
+
+# 可选端点（在火山方舟控制台创建，不设置则使用模型名直连）
+export CHANGDU_SEED_TEXT_ENDPOINT="你的文本端点ID"
+export CHANGDU_SEEDREAM_ENDPOINT="你的图像端点ID"
+export CHANGDU_SEEDANCE_ENDPOINT="你的视频端点ID"
+
+# 可选基础地址
 export CHANGDU_ARK_BASE_URL="https://ark.cn-beijing.volces.com"
-export CHANGDU_SEED_TEXT_ENDPOINT="ep-m-20260328105436-n2x7w"
-export CHANGDU_SEEDREAM_ENDPOINT="ep-m-20260403105201-9p9g6"
-export CHANGDU_SEEDANCE_ENDPOINT="ep-20260326170052-hjksg"
 ```
 
-`ARK_API_KEY` is also accepted as a fallback.
+`ARK_API_KEY` 也可作为 fallback。
 
-You can also set per-run overrides:
+也可以通过命令行参数临时覆盖：
 
 ```bash
-changdu --api-key "<your_key>" \
-  --seedream-endpoint "ep-m-20260403105201-9p9g6" \
-  --seedance-endpoint "ep-20260326170052-hjksg" \
-  auth check
+changdu --api-key "xxx" --seedream-endpoint "ep-xxx" auth check
 ```
 
-## Quick Start
+## 快速开始
 
 ```bash
+# 验证配置
 changdu auth check
-```
 
-Generate image:
+# 文生图
+changdu text2image --prompt "江南水乡，水墨画风" --output 水乡.jpg
 
-```bash
-changdu image generate \
-  --prompt-file ../末班咖啡馆/角色/林晚.prompt.txt \
-  --output ./out/linwan.jpg
-```
+# 文生视频
+changdu text2video --prompt "夜景街道，电影感" --ratio 16:9 --duration 15 --wait --output clip.mp4
 
-Submit video:
+# 多图参考生视频
+changdu multimodal2video \
+  --image 角色.jpg --image 场景.jpg \
+  --prompt "图1是主角，图2是场景。" \
+  --ratio 16:9 --duration 15 --wait --output clip.mp4
 
-```bash
-changdu video generate \
-  --prompt-file ../末班咖啡馆/单集制作/EP001/视频_Clip001.prompt.txt \
-  --image ../末班咖啡馆/角色/林晚.jpg \
-  --image ../末班咖啡馆/角色/陈默.jpg \
-  --image ../末班咖啡馆/场景/深夜街角咖啡馆.jpg
-```
+# 查询任务
+changdu query_result --submit_id <任务ID>
 
-Query and wait:
-
-```bash
-changdu task show <task_id>
-changdu task wait <task_id> --output ./out/clip001.mp4
-```
-
-## Batch
-
-```bash
-changdu batch run ./examples/ep001.batch.yaml
-```
-
-Batch spec supports jobs of type `image` and `video`.
-
-## Trajectory
-
-Each command creates a run record in `~/.local/share/changdu/runs` by default:
-
-- `meta.json`
-- `events.jsonl`
-
-Inspect:
-
-```bash
-changdu trajectory list
-changdu trajectory show <run_id>
-changdu trajectory export <run_id> --output ./run.json
+# 查看示例
+changdu examples
 ```

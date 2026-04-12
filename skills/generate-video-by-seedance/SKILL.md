@@ -15,10 +15,10 @@ metadata: {}
 test -n "$CHANGDU_ARK_API_KEY" || test -n "$ARK_API_KEY"
 ```
 
-可选视频端点：
+可选视频端点（在火山方舟控制台创建后设置）：
 
 ```bash
-export CHANGDU_SEEDANCE_ENDPOINT="ep-m-20260326222518-52x8x"
+export CHANGDU_SEEDANCE_ENDPOINT="你的视频端点ID"
 ```
 
 ## 文生视频

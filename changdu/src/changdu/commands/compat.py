@@ -312,9 +312,9 @@ def register_compat_commands(app: typer.Typer) -> None:
     def examples() -> None:
         typer.echo("【环境变量配置】")
         typer.echo('export CHANGDU_ARK_API_KEY="你的API Key"')
-        typer.echo('export CHANGDU_SEED_TEXT_ENDPOINT="ep-m-20260328105436-n2x7w"')
-        typer.echo('export CHANGDU_SEEDREAM_ENDPOINT="ep-m-20260403105201-9p9g6"')
-        typer.echo('export CHANGDU_SEEDANCE_ENDPOINT="ep-20260326170052-hjksg"')
+        typer.echo('export CHANGDU_SEED_TEXT_ENDPOINT="你的文本端点ID"    # 可选')
+        typer.echo('export CHANGDU_SEEDREAM_ENDPOINT="你的图像端点ID"    # 可选')
+        typer.echo('export CHANGDU_SEEDANCE_ENDPOINT="你的视频端点ID"    # 可选')
         typer.echo("")
         typer.echo("【示例1：文生图】")
         typer.echo('changdu text2image --prompt "一只猫的肖像" --ratio 1:1 --resolution_type 2k --output ./out/cat.jpg')

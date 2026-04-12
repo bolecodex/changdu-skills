@@ -15,10 +15,10 @@ metadata: {}
 test -n "$CHANGDU_ARK_API_KEY" || test -n "$ARK_API_KEY"
 ```
 
-可选图片端点：
+可选图片端点（在火山方舟控制台创建后设置）：
 
 ```bash
-export CHANGDU_SEEDREAM_ENDPOINT="ep-m-20260403105201-9p9g6"
+export CHANGDU_SEEDREAM_ENDPOINT="你的图像端点ID"
 ```
 
 ## 文生图
