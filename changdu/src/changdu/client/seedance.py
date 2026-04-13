@@ -36,19 +36,25 @@ class SeedanceClient:
         fail_reason = data.get("reason") or data.get("error_message")
 
         file_url = None
+        last_frame_url = None
         content = data.get("content") or {}
         if isinstance(content, dict):
             file_url = content.get("video_url")
+            last_frame_url = content.get("last_frame_url")
             if not file_url:
                 video_obj = content.get("video") or {}
                 if isinstance(video_obj, dict):
                     file_url = video_obj.get("url")
+                    if not last_frame_url:
+                        last_frame_url = video_obj.get("last_frame_url")
         file_url = file_url or data.get("url")
+        last_frame_url = last_frame_url or data.get("last_frame_url")
 
         return TaskStatusResponse(
             task_id=task_id,
             status=status,
             file_url=file_url,
+            last_frame_url=last_frame_url,
             fail_reason=fail_reason,
             request_id=request_id,
         )

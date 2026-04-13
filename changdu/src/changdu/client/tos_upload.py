@@ -49,7 +49,14 @@ def upload_file(
 
     content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
 
-    client = tos.TosClientV2(ak, sk, endpoint, region)
+    file_size = file_path.stat().st_size
+    timeout_s = max(120, file_size // (256 * 1024))  # ~4 KB/s worst-case
+
+    client = tos.TosClientV2(
+        ak, sk, endpoint, region,
+        connection_time=30,
+        socket_timeout=timeout_s,
+    )
 
     acl = tos.ACLType.ACL_Public_Read if public else tos.ACLType.ACL_Private
 
@@ -58,6 +65,7 @@ def upload_file(
             bucket,
             key,
             content=f,
+            content_length=file_size,
             content_type=content_type,
             acl=acl,
         )

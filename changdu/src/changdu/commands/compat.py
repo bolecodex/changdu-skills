@@ -97,6 +97,8 @@ def register_compat_commands(app: typer.Typer) -> None:
         model: str | None = typer.Option(None, "--model", help="覆盖视频模型/端点 ID。"),
         wait: bool = typer.Option(False, "--wait", help="是否等待任务完成。"),
         output: Path | None = typer.Option(None, "--output", help="等待完成时的视频保存路径。"),
+        return_last_frame: bool = typer.Option(False, "--return-last-frame", help="返回生成视频的尾帧URL（用于连续生成）。"),
+        first_frame_url: str | None = typer.Option(None, "--first-frame-url", help="指定首帧图片URL（来自上一 clip 的尾帧）。"),
     ) -> None:
         _submit_video_compat(
             ctx=ctx,
@@ -109,6 +111,8 @@ def register_compat_commands(app: typer.Typer) -> None:
             wait=wait,
             output=output,
             run_name="text2video",
+            return_last_frame=return_last_frame,
+            first_frame_url=first_frame_url,
         )
 
     @app.command("multimodal2video", help="多图参考生成视频（支持 Asset 素材引用）。")
@@ -122,6 +126,8 @@ def register_compat_commands(app: typer.Typer) -> None:
         model: str | None = typer.Option(None, "--model", help="覆盖视频模型/端点 ID。"),
         wait: bool = typer.Option(False, "--wait", help="是否等待任务完成。"),
         output: Path | None = typer.Option(None, "--output", help="等待完成时的视频保存路径。"),
+        return_last_frame: bool = typer.Option(False, "--return-last-frame", help="返回生成视频的尾帧URL（用于连续生成）。"),
+        first_frame_url: str | None = typer.Option(None, "--first-frame-url", help="指定首帧图片URL（来自上一 clip 的尾帧）。"),
     ) -> None:
         _submit_video_compat(
             ctx=ctx,
@@ -134,6 +140,8 @@ def register_compat_commands(app: typer.Typer) -> None:
             wait=wait,
             output=output,
             run_name="multimodal2video",
+            return_last_frame=return_last_frame,
+            first_frame_url=first_frame_url,
         )
 
     @app.command("image2video", help="单图生成视频（支持 Asset 素材引用）。")
@@ -147,6 +155,8 @@ def register_compat_commands(app: typer.Typer) -> None:
         model: str | None = typer.Option(None, "--model", help="覆盖视频模型/端点 ID。"),
         wait: bool = typer.Option(False, "--wait", help="是否等待任务完成。"),
         output: Path | None = typer.Option(None, "--output", help="等待完成时的视频保存路径。"),
+        return_last_frame: bool = typer.Option(False, "--return-last-frame", help="返回生成视频的尾帧URL（用于连续生成）。"),
+        first_frame_url: str | None = typer.Option(None, "--first-frame-url", help="指定首帧图片URL（来自上一 clip 的尾帧）。"),
     ) -> None:
         images = [image] if image else []
         asset_ids = [asset] if asset else []
@@ -164,6 +174,8 @@ def register_compat_commands(app: typer.Typer) -> None:
             wait=wait,
             output=output,
             run_name="image2video",
+            return_last_frame=return_last_frame,
+            first_frame_url=first_frame_url,
         )
 
     @app.command("multiframe2video", help="多图叙事生成视频（支持 Asset 素材引用）。")
@@ -177,6 +189,8 @@ def register_compat_commands(app: typer.Typer) -> None:
         model: str | None = typer.Option(None, "--model", help="覆盖视频模型/端点 ID。"),
         wait: bool = typer.Option(False, "--wait", help="是否等待任务完成。"),
         output: Path | None = typer.Option(None, "--output", help="等待完成时的视频保存路径。"),
+        return_last_frame: bool = typer.Option(False, "--return-last-frame", help="返回生成视频的尾帧URL（用于连续生成）。"),
+        first_frame_url: str | None = typer.Option(None, "--first-frame-url", help="指定首帧图片URL（来自上一 clip 的尾帧）。"),
     ) -> None:
         _submit_video_compat(
             ctx=ctx,
@@ -189,6 +203,8 @@ def register_compat_commands(app: typer.Typer) -> None:
             wait=wait,
             output=output,
             run_name="multiframe2video",
+            return_last_frame=return_last_frame,
+            first_frame_url=first_frame_url,
         )
 
     @app.command("frames2video", help="首尾帧插值生成视频。")
@@ -535,6 +551,262 @@ def register_compat_commands(app: typer.Typer) -> None:
         for g in groups:
             typer.echo(f"  {g.id}  名称={g.name}  描述={g.description or '-'}")
 
+    @app.command("sequential-generate", help="按顺序生成多个视频片段，自动用前一个视频的尾帧衔接下一个，保证连贯性。")
+    def sequential_generate(
+        ctx: typer.Context,
+        prompt_dir: Path = typer.Option(..., "--prompt-dir", help="包含 视频_ClipXXX.prompt.txt 的目录。"),
+        image: list[Path] = typer.Option([], "--image", help="参考图（每个 clip 共享），可重复传入。"),
+        asset: list[str] = typer.Option([], "--asset", help="Asset 素材ID（每个 clip 共享），可重复传入。"),
+        ratio: str = typer.Option("16:9", "--ratio", help="视频比例。"),
+        duration: int = typer.Option(15, "--duration", help="每个 clip 的时长（秒）。"),
+        model: str | None = typer.Option(None, "--model", help="覆盖视频模型/端点 ID。"),
+        output_dir: Path = typer.Option(None, "--output-dir", help="视频输出目录（默认同 prompt-dir）。"),
+        extract_keyframes: bool = typer.Option(True, "--extract-keyframes/--no-keyframes", help="是否从前一 clip 抽取关键帧作为额外参考。"),
+        prompt_header: str = typer.Option("", "--prompt-header", help="每个 clip 提示词前缀（如角色/场景说明）。"),
+    ) -> None:
+        import re
+        from changdu.utils import extract_keyframes as _extract_kf
+
+        obj: AppContext = ctx.obj
+        out_dir = output_dir or prompt_dir
+
+        prompt_files = sorted(
+            [f for f in prompt_dir.iterdir() if re.match(r"视频_Clip\d+\.prompt\.txt$", f.name)],
+            key=lambda f: f.name,
+        )
+        if not prompt_files:
+            typer.echo(f"错误：在 {prompt_dir} 中未找到 视频_ClipXXX.prompt.txt 文件。", err=True)
+            raise typer.Exit(1)
+
+        typer.echo(f"共发现 {len(prompt_files)} 个 clip 待生成，将按顺序逐个生成（尾帧衔接模式）")
+
+        last_frame_url: str | None = None
+        for idx, pf in enumerate(prompt_files):
+            clip_num = re.search(r"Clip(\d+)", pf.name)
+            clip_label = clip_num.group(0) if clip_num else f"Clip{idx+1:03d}"
+            clip_prompt = pf.read_text(encoding="utf-8").strip()
+            full_prompt = f"{prompt_header}{clip_prompt}" if prompt_header else clip_prompt
+            clip_output = out_dir / f"视频_{clip_label}.mp4"
+
+            typer.echo(f"\n{'='*50}")
+            typer.echo(f"[{idx+1}/{len(prompt_files)}] 正在生成 {clip_label} ...")
+
+            extra_ref_images: list[Path] = []
+            if idx > 0 and extract_keyframes and not last_frame_url:
+                prev_clip = out_dir / f"视频_{prev_label}.mp4"
+                if prev_clip.exists():
+                    typer.echo(f"  从 {prev_label} 抽取关键帧 ...")
+                    kf_dir = out_dir / "keyframes"
+                    extra_ref_images = _extract_kf(prev_clip, kf_dir)
+                    typer.echo(f"  抽取到 {len(extra_ref_images)} 帧参考图")
+
+            all_images = list(image) + extra_ref_images if not last_frame_url else []
+
+            result = _submit_video_compat(
+                ctx=ctx,
+                prompt=full_prompt,
+                images=all_images,
+                asset_ids=asset,
+                ratio=ratio,
+                duration=duration,
+                model=model,
+                wait=True,
+                output=clip_output,
+                run_name=f"sequential-{clip_label}",
+                return_last_frame=True,
+                first_frame_url=last_frame_url,
+            )
+
+            if result and result.last_frame_url:
+                last_frame_url = result.last_frame_url
+                typer.echo(f"  尾帧URL已缓存，将用于 {clip_label} → 下一 clip 衔接")
+            else:
+                last_frame_url = None
+
+            prev_label = clip_label
+
+        typer.echo(f"\n{'='*50}")
+        typer.echo(f"全部 {len(prompt_files)} 个 clip 生成完毕！输出目录: {out_dir}")
+
+    @app.command("clip-regen", help="重新生成单个 clip，可指定前一 clip 提供视觉上下文。")
+    def clip_regen(
+        ctx: typer.Context,
+        clip: int = typer.Option(..., "--clip", help="要重新生成的 clip 编号（如 4）。"),
+        prompt_dir: Path = typer.Option(..., "--prompt-dir", help="包含 视频_ClipXXX.prompt.txt 的目录。"),
+        image: list[Path] = typer.Option([], "--image", help="参考图，可重复传入。"),
+        asset: list[str] = typer.Option([], "--asset", help="Asset 素材ID，可重复传入。"),
+        prev_clip: Path | None = typer.Option(None, "--prev-clip", help="前一 clip 的视频文件（用于抽取尾帧作为参考）。"),
+        ratio: str = typer.Option("16:9", "--ratio", help="视频比例。"),
+        duration: int = typer.Option(15, "--duration", help="时长（秒）。"),
+        model: str | None = typer.Option(None, "--model", help="覆盖视频模型/端点 ID。"),
+        prompt_header: str = typer.Option("", "--prompt-header", help="提示词前缀。"),
+        output: Path | None = typer.Option(None, "--output", help="输出路径（默认覆盖原文件）。"),
+    ) -> None:
+        from changdu.utils import extract_keyframes as _extract_kf
+
+        clip_label = f"Clip{clip:03d}"
+        prompt_file = prompt_dir / f"视频_{clip_label}.prompt.txt"
+        if not prompt_file.exists():
+            typer.echo(f"错误：未找到 {prompt_file}", err=True)
+            raise typer.Exit(1)
+
+        clip_prompt = prompt_file.read_text(encoding="utf-8").strip()
+        full_prompt = f"{prompt_header}{clip_prompt}" if prompt_header else clip_prompt
+        clip_output = output or (prompt_dir / f"视频_{clip_label}.mp4")
+
+        typer.echo(f"正在重新生成 {clip_label} ...")
+
+        extra_ref_images: list[Path] = []
+        if prev_clip and prev_clip.exists():
+            typer.echo(f"  从 {prev_clip.name} 抽取关键帧作为参考 ...")
+            kf_dir = prompt_dir / "keyframes"
+            extra_ref_images = _extract_kf(prev_clip, kf_dir)
+            typer.echo(f"  抽取到 {len(extra_ref_images)} 帧参考图")
+
+        all_images = list(image) + extra_ref_images
+
+        result = _submit_video_compat(
+            ctx=ctx,
+            prompt=full_prompt,
+            images=all_images,
+            asset_ids=asset,
+            ratio=ratio,
+            duration=duration,
+            model=model,
+            wait=True,
+            output=clip_output,
+            run_name=f"clip-regen-{clip_label}",
+            return_last_frame=True,
+        )
+
+        if result and result.last_frame_url:
+            typer.echo(f"  新尾帧URL: {result.last_frame_url}")
+        typer.echo(f"{clip_label} 重新生成完毕: {clip_output}")
+
+    @app.command("clip-transition", help="用 ffmpeg 在两个 clip 之间添加转场效果（淡入淡出/裁剪/拼接）。")
+    def clip_transition(
+        ctx: typer.Context,
+        clip_a: Path = typer.Option(..., "--clip-a", help="前一个视频片段。"),
+        clip_b: Path = typer.Option(..., "--clip-b", help="后一个视频片段。"),
+        transition: str = typer.Option("fade", "--transition", help="转场类型：fade/dissolve/wipeleft/none。"),
+        trans_duration: float = typer.Option(0.5, "--duration", help="转场时长（秒）。"),
+        trim_a_tail: float = typer.Option(0.0, "--trim-a-tail", help="裁掉前一 clip 尾部的秒数。"),
+        trim_b_head: float = typer.Option(0.0, "--trim-b-head", help="裁掉后一 clip 头部的秒数。"),
+        output: Path = typer.Option(..., "--output", help="输出合并后的视频路径。"),
+    ) -> None:
+        import subprocess
+
+        if not clip_a.exists():
+            typer.echo(f"错误：文件不存在 {clip_a}", err=True)
+            raise typer.Exit(1)
+        if not clip_b.exists():
+            typer.echo(f"错误：文件不存在 {clip_b}", err=True)
+            raise typer.Exit(1)
+
+        output.parent.mkdir(parents=True, exist_ok=True)
+        tmp_a = output.parent / f"_trim_a_{clip_a.name}"
+        tmp_b = output.parent / f"_trim_b_{clip_b.name}"
+
+        try:
+            src_a = clip_a
+            if trim_a_tail > 0:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(clip_a)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                dur_a = float(probe.stdout.strip()) if probe.stdout.strip() else 15.0
+                end_a = max(dur_a - trim_a_tail, 1.0)
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", str(clip_a), "-to", str(end_a), "-c:v", "libx264", "-crf", "18", "-c:a", "aac", str(tmp_a)],
+                    capture_output=True, timeout=120,
+                )
+                src_a = tmp_a
+                typer.echo(f"  裁剪 {clip_a.name} 尾部 {trim_a_tail}s → {end_a:.1f}s")
+
+            src_b = clip_b
+            if trim_b_head > 0:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", str(clip_b), "-ss", str(trim_b_head), "-c:v", "libx264", "-crf", "18", "-c:a", "aac", str(tmp_b)],
+                    capture_output=True, timeout=120,
+                )
+                src_b = tmp_b
+                typer.echo(f"  裁剪 {clip_b.name} 头部 {trim_b_head}s")
+
+            if transition == "none":
+                filelist = output.parent / "_concat_list.txt"
+                filelist.write_text(f"file '{src_a}'\nfile '{src_b}'\n")
+                subprocess.run(
+                    ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(filelist), "-c", "copy", str(output)],
+                    capture_output=True, timeout=120,
+                )
+                filelist.unlink(missing_ok=True)
+            else:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(src_a)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                offset = float(probe.stdout.strip()) - trans_duration if probe.stdout.strip() else 14.5
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", str(src_a), "-i", str(src_b),
+                     "-filter_complex", f"xfade=transition={transition}:duration={trans_duration}:offset={offset}",
+                     "-c:v", "libx264", "-crf", "18", str(output)],
+                    capture_output=True, timeout=120,
+                )
+
+            typer.echo(f"转场合并完成: {output}")
+        finally:
+            tmp_a.unlink(missing_ok=True)
+            tmp_b.unlink(missing_ok=True)
+
+    @app.command("color-match", help="对目录下所有 clip 进行亮度/色调统一处理。")
+    def color_match(
+        ctx: typer.Context,
+        input_dir: Path = typer.Option(..., "--input-dir", help="包含 视频_ClipXXX.mp4 的目录。"),
+        output_dir: Path = typer.Option(None, "--output-dir", help="调色后输出目录（默认在原目录下创建 graded/ 子目录）。"),
+        brightness: float = typer.Option(0.0, "--brightness", help="亮度调整（-1.0 到 1.0）。"),
+        contrast: float = typer.Option(1.0, "--contrast", help="对比度（0.5 到 2.0，默认 1.0 不变）。"),
+        saturation: float = typer.Option(1.0, "--saturation", help="饱和度（0.0 到 3.0，默认 1.0 不变）。"),
+        gamma: float = typer.Option(1.0, "--gamma", help="伽马值（0.1 到 10.0，默认 1.0 不变）。"),
+        preset: str | None = typer.Option(None, "--preset", help="曲线预设：vintage/strong_contrast/darker/lighter。"),
+    ) -> None:
+        import re
+        import subprocess
+
+        out_dir = output_dir or (input_dir / "graded")
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        clips = sorted(
+            [f for f in input_dir.iterdir() if re.match(r"视频_Clip\d+\.mp4$", f.name)],
+            key=lambda f: f.name,
+        )
+        if not clips:
+            typer.echo(f"错误：在 {input_dir} 中未找到 视频_ClipXXX.mp4 文件。", err=True)
+            raise typer.Exit(1)
+
+        vf_parts: list[str] = []
+        needs_eq = brightness != 0.0 or contrast != 1.0 or saturation != 1.0 or gamma != 1.0
+        if needs_eq:
+            vf_parts.append(f"eq=brightness={brightness}:contrast={contrast}:saturation={saturation}:gamma={gamma}")
+        if preset:
+            vf_parts.append(f"curves=preset={preset}")
+
+        if not vf_parts:
+            vf_parts.append("eq=brightness=0:contrast=1")
+
+        vf = ",".join(vf_parts)
+        typer.echo(f"调色滤镜: {vf}")
+        typer.echo(f"共 {len(clips)} 个 clip 待处理")
+
+        for clip in clips:
+            out_path = out_dir / clip.name
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(clip), "-vf", vf, "-c:v", "libx264", "-crf", "18", "-c:a", "aac", str(out_path)],
+                capture_output=True, timeout=300,
+            )
+            typer.echo(f"  {clip.name} → {out_path}")
+
+        typer.echo(f"全部调色完成，输出目录: {out_dir}")
+
     @app.command("examples", help="显示可直接复制的示例命令。")
     def examples() -> None:
         typer.echo("【环境变量配置】")
@@ -570,6 +842,45 @@ def register_compat_commands(app: typer.Typer) -> None:
         typer.echo('changdu asset-get --id <素材ID>')
         typer.echo('# 4) 用素材生成真人视频')
         typer.echo('changdu multimodal2video --asset <素材ID> --asset <素材ID2> --prompt "图片1的女孩..." --wait --output clip.mp4')
+        typer.echo("")
+        typer.echo("【示例7：连续视频生成（尾帧衔接）】")
+        typer.echo("# 一键顺序生成多个 clip，自动用前一 clip 的尾帧作为下一 clip 的首帧")
+        typer.echo("changdu sequential-generate \\")
+        typer.echo("  --prompt-dir ./单集制作/EP001/ \\")
+        typer.echo("  --asset <角色ID> --asset <场景ID> \\")
+        typer.echo("  --ratio 16:9 --duration 15 \\")
+        typer.echo('  --prompt-header "图片1是主角，图片2是场景。" \\')
+        typer.echo("  --output-dir ./单集制作/EP001/")
+        typer.echo("")
+        typer.echo("【示例8：手动尾帧衔接（单个命令）】")
+        typer.echo("# 第1个 clip：生成视频并返回尾帧URL")
+        typer.echo('changdu multimodal2video --image 角色.jpg --prompt "..." --wait --output clip001.mp4 --return-last-frame')
+        typer.echo("# 第2个 clip：将上一 clip 的尾帧URL作为首帧")
+        typer.echo('changdu multimodal2video --image 角色.jpg --prompt "..." --wait --output clip002.mp4 --return-last-frame --first-frame-url <上一clip的尾帧URL>')
+        typer.echo("")
+        typer.echo("【示例9：单 clip 重新生成（修复穿帮）】")
+        typer.echo("# 用改进后的 prompt 重新生成第4个 clip，用第3个 clip 的尾帧做参考")
+        typer.echo("changdu clip-regen \\")
+        typer.echo("  --clip 4 --prompt-dir ./单集制作/EP002/ \\")
+        typer.echo("  --asset <角色ID> --asset <场景ID> \\")
+        typer.echo("  --prev-clip ./单集制作/EP002/视频_Clip003.mp4 \\")
+        typer.echo("  --ratio 16:9 --duration 15")
+        typer.echo("")
+        typer.echo("【示例10：相邻 clip 添加转场】")
+        typer.echo("# 裁掉 clip3 尾部2秒 + clip4 头部1秒，添加淡入淡出转场")
+        typer.echo("changdu clip-transition \\")
+        typer.echo("  --clip-a 视频_Clip003.mp4 --clip-b 视频_Clip004.mp4 \\")
+        typer.echo("  --transition fade --duration 0.5 \\")
+        typer.echo("  --trim-a-tail 2.0 --trim-b-head 1.0 \\")
+        typer.echo("  --output merged_003_004.mp4")
+        typer.echo("")
+        typer.echo("【示例11：全片色调统一】")
+        typer.echo("# 偏暗月光色调 + vintage 曲线")
+        typer.echo("changdu color-match \\")
+        typer.echo("  --input-dir ./单集制作/EP002/ \\")
+        typer.echo("  --output-dir ./单集制作/EP002/graded/ \\")
+        typer.echo("  --brightness -0.05 --contrast 1.1 --saturation 0.9 \\")
+        typer.echo("  --preset vintage")
 
 
 def _submit_video_compat(
@@ -584,7 +895,11 @@ def _submit_video_compat(
     wait: bool,
     output: Path | None,
     run_name: str,
-) -> None:
+    return_last_frame: bool = False,
+    first_frame_url: str | None = None,
+) -> Any:
+    """Submit a video generation request. Returns TaskStatusResponse when wait=True, None otherwise."""
+
     obj: AppContext = ctx.obj
     run_id = obj.trajectory_store.create_run(run_name)
     encoded_images = [encode_image_to_data_url(p) for p in images]
@@ -596,6 +911,8 @@ def _submit_video_compat(
         ratio=ratio,
         duration=duration,
         images=all_image_refs,
+        return_last_frame=return_last_frame,
+        first_frame_url=first_frame_url,
     )
     client = _build_seedance(obj)
     submitted = client.submit(req)
@@ -606,7 +923,7 @@ def _submit_video_compat(
             {"submit_id": submitted.task_id, "run_id": run_id, "status": "submitted"},
             [f"任务ID: {submitted.task_id}", f"运行ID: {run_id}", f"状态: {_status_cn('submitted')}"],
         )
-        return
+        return None
 
     result = poll_task(
         fetcher=client.status,
@@ -620,11 +937,22 @@ def _submit_video_compat(
         raise RequestError(f"Task failed: {result.fail_reason or result.status}", request_id=result.request_id)
     if output and result.file_url:
         download_binary(result.file_url, output)
-    _emit(
-        obj,
-        {"submit_id": submitted.task_id, "status": result.status, "output": str(output) if output else None},
-        [f"任务ID: {submitted.task_id}", f"状态: {_status_cn(result.status)}", f"已保存: {output}" if output else "已保存: -"],
-    )
+
+    out_payload: dict[str, Any] = {
+        "submit_id": submitted.task_id,
+        "status": result.status,
+        "output": str(output) if output else None,
+    }
+    pretty: list[str] = [
+        f"任务ID: {submitted.task_id}",
+        f"状态: {_status_cn(result.status)}",
+        f"已保存: {output}" if output else "已保存: -",
+    ]
+    if result.last_frame_url:
+        out_payload["last_frame_url"] = result.last_frame_url
+        pretty.append(f"尾帧URL: {result.last_frame_url}")
+    _emit(obj, out_payload, pretty)
+    return result
 
 
 @dataclass

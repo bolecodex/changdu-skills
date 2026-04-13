@@ -33,20 +33,32 @@ class VideoGenerateRequest(BaseModel):
     ratio: str = "16:9"
     duration: int = 15
     images: list[str] = Field(default_factory=list)
+    return_last_frame: bool = False
+    first_frame_url: str | None = None
 
     def to_api_payload(self) -> dict[str, Any]:
         content: list[dict[str, Any]] = []
         text_prompt = self.prompt.strip()
         if text_prompt:
             content.append({"type": "text", "text": text_prompt})
-        for img in self.images:
+        if self.first_frame_url:
+            # API constraint: first_frame cannot be mixed with reference_image
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {"url": img},
-                    "role": "reference_image",
+                    "image_url": {"url": self.first_frame_url},
+                    "role": "first_frame",
                 }
             )
+        else:
+            for img in self.images:
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": img},
+                        "role": "reference_image",
+                    }
+                )
         payload: dict[str, Any] = {
             "model": self.model,
             "content": content,
@@ -54,4 +66,6 @@ class VideoGenerateRequest(BaseModel):
             "duration": self.duration,
             "watermark": False,
         }
+        if self.return_last_frame:
+            payload["return_last_frame"] = True
         return payload
