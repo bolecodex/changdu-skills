@@ -71,26 +71,59 @@ changdu asset-create --file ./场景/会议室.jpg --group-id <组ID> --type Ima
 
 记录每个素材的 Asset ID，后续视频生成时使用。
 
-### 步骤 6：生成每个 clip
+### 步骤 6：生成每个 clip（顺序生成，尾帧衔接）
 
 调用 `storyboard-to-seedance-prompt` 产出 `视频_ClipXXX.prompt.txt`。
+
+**关键原则**：视频必须按 Clip 顺序逐个生成，前一个 clip 的尾帧自动作为下一个 clip 的首帧，保证角色和场景的连贯性。
+
+#### 推荐方式：`sequential-generate` 一键命令
 
 **漫剧模式**（传图片文件）：
 
 ```bash
-changdu multimodal2video \
+changdu sequential-generate \
+  --prompt-dir ./单集制作/EP001/ \
   --image 角色/女主.jpg --image 场景/会议室.jpg \
-  --prompt "图1是女主，图2是场景。$(cat 视频_Clip001.prompt.txt)" \
-  --ratio 16:9 --duration 15 --wait --output 视频_Clip001.mp4
+  --ratio 16:9 --duration 15 \
+  --prompt-header "图1是女主，图2是场景。" \
+  --output-dir ./单集制作/EP001/
 ```
 
 **真人剧模式**（传 Asset ID）：
 
 ```bash
-changdu multimodal2video \
+changdu sequential-generate \
+  --prompt-dir ./单集制作/EP001/ \
   --asset <女主面部ID> --asset <女主妆造ID> --asset <场景ID> \
-  --prompt "图片1的女孩（妆造参考图片2）站在图片3的场景中。$(cat 视频_Clip001.prompt.txt)" \
-  --ratio 16:9 --duration 15 --wait --output 视频_Clip001.mp4
+  --ratio 16:9 --duration 15 \
+  --prompt-header "图片1的女孩（妆造参考图片2）站在图片3的场景中。" \
+  --output-dir ./单集制作/EP001/
+```
+
+该命令自动完成：
+1. 扫描目录内 `视频_ClipXXX.prompt.txt` 文件（按编号排序）
+2. 按顺序逐个生成，每个 clip 启用 `return_last_frame`
+3. 将前一 clip 的尾帧 URL 作为下一 clip 的 `first_frame_url`
+4. 可选从前一视频中抽取关键帧作为额外参考（默认开启）
+
+#### 手动方式（按需单个生成）
+
+```bash
+# 第1个 clip
+changdu multimodal2video \
+  --image 角色/女主.jpg --image 场景/会议室.jpg \
+  --prompt "图1是女主，图2是场景。$(cat 视频_Clip001.prompt.txt)" \
+  --ratio 16:9 --duration 15 --wait --output 视频_Clip001.mp4 \
+  --return-last-frame
+# 输出中包含「尾帧URL: https://...」
+
+# 第2个 clip：用上一 clip 的尾帧URL
+changdu multimodal2video \
+  --image 角色/女主.jpg --image 场景/会议室.jpg \
+  --prompt "图1是女主，图2是场景。$(cat 视频_Clip002.prompt.txt)" \
+  --ratio 16:9 --duration 15 --wait --output 视频_Clip002.mp4 \
+  --return-last-frame --first-frame-url <上一clip输出的尾帧URL>
 ```
 
 ### 步骤 7：拼接成片
