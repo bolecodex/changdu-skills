@@ -76,6 +76,31 @@ changdu asset-create --file ./场景/会议室.jpg --group-id <组ID> --type Ima
 
 调用 `storyboard-to-seedance-prompt` 产出 `视频_ClipXXX.prompt.txt`。
 
+#### 步骤 6.5：提示词优化（生成前质量把关）
+
+在生成视频之前，先用 `prompt-optimize` 对所有 prompt 文件进行预检和自动优化：
+
+```bash
+# 1) 检查模式：扫描结构/画质/运镜/动作问题
+changdu prompt-optimize --dir ./单集制作/EP001/ --check
+
+# 2) 自动优化：追加画质约束、面部稳定、范围边界（输出到新目录确认无误后覆盖）
+changdu prompt-optimize --dir ./单集制作/EP001/ --output-dir ./单集制作/EP001/optimized/ --style '电影写实'
+
+# 3) 确认无误后用优化版替换原文件
+cp ./单集制作/EP001/optimized/*.prompt.txt ./单集制作/EP001/
+```
+
+`prompt-optimize` 基于 Seedance 2.0 提示词指南，自动检查并修复：
+- 缺失的角色锚定/道具锁定/场景锁定/否定约束块
+- 无时间轴分镜结构
+- 抽象情绪词（应替换为具体身体信号）
+- 运镜堆叠（单段超过 3 种运镜会导致画面抖动）
+- 高强度动作词（Seedance 偏好缓慢连续动作）
+- 缺失的范围边界声明（防止叙事泄漏）
+- 缺失的 `不要BGM，不要字幕` 尾部约束
+- 缺失的动作过渡词（提升连贯性）
+
 **关键原则**：视频必须按 Clip 顺序逐个生成，前一个 clip 的尾帧自动作为下一个 clip 的首帧，保证角色和场景的连贯性。
 
 #### 推荐方式：`sequential-generate` 一键命令

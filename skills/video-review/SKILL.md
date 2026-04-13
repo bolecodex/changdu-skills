@@ -68,6 +68,31 @@ done
 - 全局: COLOR（统一全片月光色调）
 ```
 
+### Step 3.5：提示词预检与优化
+
+在执行修复之前，先对所有 prompt 文件进行质量检查和自动优化：
+
+```bash
+# 检查模式：扫描所有 prompt 的结构/画质/运镜/动作问题
+changdu prompt-optimize --dir ./ --check
+
+# 自动修复模式：追加画质约束、面部稳定、范围边界等（保存到新目录）
+changdu prompt-optimize --dir ./ --output-dir ./optimized/ --style '古风电影写实'
+
+# 直接覆盖原文件（适合确认无误后使用）
+changdu prompt-optimize --dir ./ --style '电影写实'
+```
+
+`prompt-optimize` 检查的 8 类问题：
+- **缺失约束块**：角色锚定、道具锁定、场景锁定、否定约束是否齐全
+- **时间轴结构**：是否使用 `0–5s:` 格式的分镜时序
+- **抽象情绪词**：`很悲伤/非常愤怒` → 应改为 `嘴角颤抖/眼眶渐红`
+- **运镜堆叠**：单段内超过 3 种运镜方式会导致画面不稳定
+- **高强度动作词**：`狂奔/大跳/剧烈翻滚` Seedance 不擅长处理
+- **范围边界**：是否有 `本段仅展示上述动作` 防止叙事泄漏
+- **尾部约束**：是否有 `不要BGM，不要字幕`
+- **动作过渡词**：是否有 `顺势/借着/紧接着` 提升动作连贯性
+
 ### Step 4：执行修复
 
 按修复计划逐项执行：
@@ -143,4 +168,4 @@ ffmpeg -f concat -safe 0 -i concat_list.txt -c copy 最终版.mp4
 - `storyboard-to-seedance-prompt`（提示词生成规范）
 - `novel-to-video`（整体工作流）
 - `ffmpeg-video-processing`（视频后处理细节）
-- `changdu` CLI（`clip-regen`、`clip-transition`、`color-match` 命令）
+- `changdu` CLI（`prompt-optimize`、`clip-regen`、`clip-transition`、`color-match` 命令）
