@@ -34,6 +34,7 @@ def show(ctx: typer.Context, task_id: str = typer.Argument(..., help="Task ID.")
         "task_id": status.task_id,
         "status": status.status,
         "file_url": status.file_url,
+        "last_frame_url": status.last_frame_url,
         "fail_reason": status.fail_reason,
         "request_id": status.request_id,
     }
@@ -44,6 +45,8 @@ def show(ctx: typer.Context, task_id: str = typer.Argument(..., help="Task ID.")
         typer.echo(f"status: {status.status}")
         if status.file_url:
             typer.echo(f"file_url: {status.file_url}")
+        if status.last_frame_url:
+            typer.echo(f"last_frame_url: {status.last_frame_url}")
         if status.fail_reason:
             typer.echo(f"fail_reason: {status.fail_reason}")
 
@@ -85,11 +88,21 @@ def wait(
         download_binary(result.file_url, output)
         obj.trajectory_store.append_event(active_run_id, "artifact", {"task_id": task_id, "output": str(output)})
 
+    last_frame_path: Path | None = None
+    if result.last_frame_url and output:
+        last_frame_path = output.with_suffix(".lastframe.jpg")
+        try:
+            download_binary(result.last_frame_url, last_frame_path)
+        except Exception:
+            last_frame_path = None
+
     payload = {
         "ok": True,
         "task_id": task_id,
         "status": result.status,
         "file_url": result.file_url,
+        "last_frame_url": result.last_frame_url,
+        "last_frame_path": str(last_frame_path) if last_frame_path else None,
         "output": str(output) if output else None,
         "run_id": active_run_id,
     }
@@ -99,3 +112,7 @@ def wait(
         typer.echo(f"Task succeeded: {task_id}")
         if output:
             typer.echo(f"saved: {output}")
+        if result.last_frame_url:
+            typer.echo(f"last_frame_url: {result.last_frame_url}")
+        if last_frame_path:
+            typer.echo(f"last_frame saved: {last_frame_path}")

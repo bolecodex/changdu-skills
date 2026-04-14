@@ -152,51 +152,46 @@ changdu multimodal2video \
   --return-last-frame --first-frame-url <上一clip输出的尾帧URL>
 ```
 
-### 步骤 7：拼接初版
+### 步骤 7：拼接成片
 
-使用 ffmpeg 拼接全部 clip 为初版视频。
+使用 `clip-concat` 拼接全部 clip（保留完整音视频）：
+
+```bash
+changdu clip-concat \
+  --input-dir ./单集制作/EP001/ \
+  --output ./单集制作/EP001/完整版.mp4
+```
 
 ### 步骤 7.5：连贯性审查与修复
 
-调用 `video-review` 技能对初版视频进行审查和修复：
+调用 `video-review` 技能对视频进行审查。**穿帮修复 = 修改 prompt + Seedance 重新生成**，不使用 FFmpeg 调色/转场。
 
 1. **提取关键帧**：对每个 clip 提取首帧/中帧/尾帧到 `analysis/` 目录
-2. **识别穿帮**：逐帧对比相邻 clip 衔接处，检查角色外貌、道具、场景、色调一致性
-3. **生成修复计划**：按 TRIM / REGEN / COLOR / TRANSITION / ACCEPT 分类
-4. **执行修复**：
-   - 对叙事泄漏的 clip 使用 `changdu clip-transition --trim-a-tail` 裁剪尾部
-   - 对角色/道具/场景穿帮的 clip 修改 prompt（强化角色锚定、道具锁定、场景锁定）后使用 `changdu clip-regen` 重新生成
-   - 对衔接生硬处使用 `changdu clip-transition --transition fade` 添加转场
-   - 对全片色调不统一使用 `changdu color-match` 调色
-5. **重新拼接**修复后的 clip
-6. **二次审查**确认问题已修复（最多迭代 2 轮）
+2. **识别穿帮**：逐帧对比相邻 clip 衔接处，检查角色外貌、道具、场景一致性
+3. **修复**（只有两种方式）：
+   - **REGEN**：修改 prompt 强化约束块 → `changdu clip-regen` 用 Seedance 重新生成
+   - **TRIM**：叙事泄漏 → `changdu clip-trim --trim-tail Xs` 裁剪
+4. **重新拼接** → `changdu clip-concat`
 
 ```bash
-# 示例：修复第4个 clip（角色外貌穿帮）
-# 1) 先修改 视频_Clip004.prompt.txt，加入正确的角色锚定块
-# 2) 重新生成
+# 穿帮修复：修改 prompt 后重新生成第4个 clip
 changdu clip-regen \
   --clip 4 --prompt-dir ./单集制作/EP001/ \
   --asset <角色ID> --asset <场景ID> \
-  --prev-clip ./单集制作/EP001/视频_Clip003.mp4 \
+  --prompt-header '图片1是男主面部，图片2是场景。' \
   --ratio 16:9 --duration 15
 
-# 示例：裁剪 clip1 尾部 + 添加转场
-changdu clip-transition \
-  --clip-a 视频_Clip001.mp4 --clip-b 视频_Clip002.mp4 \
-  --transition fade --duration 0.5 --trim-a-tail 2.0 \
-  --output fixed/merged_001_002.mp4
+# 叙事泄漏：裁剪 clip 尾部
+changdu clip-trim \
+  --input 视频_Clip003.mp4 \
+  --output 视频_Clip003.mp4 \
+  --trim-tail 2.0
 
-# 示例：全片色调统一
-changdu color-match \
+# 重新拼接
+changdu clip-concat \
   --input-dir ./单集制作/EP001/ \
-  --output-dir ./单集制作/EP001/graded/ \
-  --brightness -0.05 --contrast 1.1 --saturation 0.9
+  --output ./单集制作/EP001/最终版.mp4
 ```
-
-### 步骤 8：最终拼接成片
-
-使用 ffmpeg 拼接全部修复后的 clip 为最终视频。
 
 ## 推荐目录结构
 
