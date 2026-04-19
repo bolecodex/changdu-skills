@@ -21,5 +21,7 @@ class TaskStatusResponse(BaseModel):
     status: str
     file_url: str | None = None
     last_frame_url: str | None = None
+    audio_url: str | None = None
+    video_duration: float | None = None
     fail_reason: str | None = None
     request_id: str | None = None

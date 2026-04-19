@@ -99,9 +99,18 @@ def load_config(
         "image_size": cfg_map.get("image_size", "2K"),
         "video_ratio": cfg_map.get("video_ratio", "16:9"),
         "video_duration": int(cfg_map.get("video_duration", 15)),
-        "request_timeout_s": int(cfg_map.get("request_timeout_s", 120)),
-        "poll_interval_s": int(cfg_map.get("poll_interval_s", 10)),
-        "poll_max_wait_s": int(cfg_map.get("poll_max_wait_s", 900)),
+        "request_timeout_s": int(
+            os.getenv("CHANGDU_REQUEST_TIMEOUT_S")
+            or cfg_map.get("request_timeout_s", 120)
+        ),
+        "poll_interval_s": int(
+            os.getenv("CHANGDU_POLL_INTERVAL_S")
+            or cfg_map.get("poll_interval_s", 10)
+        ),
+        "poll_max_wait_s": int(
+            os.getenv("CHANGDU_POLL_MAX_WAIT_S")
+            or cfg_map.get("poll_max_wait_s", 900)
+        ),
         "trajectory_dir": Path(
             os.getenv("CHANGDU_TRAJECTORY_DIR", cfg_map.get("trajectory_dir", str(DEFAULT_TRAJECTORY_DIR)))
         ),

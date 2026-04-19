@@ -59,19 +59,43 @@ changdu text2video \
   --duration 15
 ```
 
-多图参考生视频：
+多模态参考生视频（图 + 视频 + 音频，三类一起喂）：
 
 ```bash
-HEAD="图1是女主参考，图2是男主参考，图3是场景参考。"
+HEAD="图1是女主三视图，图2是场景。视频1 是上一段尾段，仅做妆造与位置参考。音轨1 锁音色。"
 changdu multimodal2video \
-  --image "./角色/女主.jpg" \
-  --image "./角色/男主.jpg" \
+  --image "./角色/女主_三视图.jpg" \
   --image "./场景/场景.jpg" \
-  --prompt "${HEAD}$(python3 -c 'print(open(\"视频_Clip001.prompt.txt\",encoding=\"utf-8\").read())')" \
+  --ref-video "./单集制作/EP001/视频_Clip003.mp4" \
+  --voice-asset asset-xxxxxxxx \
+  --prompt "${HEAD}$(cat 视频_Clip004.prompt.txt)" \
   --ratio 16:9 \
   --duration 15 \
   --wait \
-  --output "./单集制作/EP001/视频_Clip001.mp4"
+  --output "./单集制作/EP001/视频_Clip004.mp4"
+```
+
+新版关键参数（适用于 `text2video` / `image2video` / `multimodal2video` / `multiframe2video` / `clip-regen` / `clip-chain-regen` / `sequential-generate`）：
+
+| 参数 | 说明 |
+|------|------|
+| `--ref-video <path/url/asset-id>` | 参考视频（最多 3 段，每段 ≤15s）。本地文件自动 TOS 上传。 |
+| `--ref-audio <path/url/asset-id>` | 参考音频（最多 3 段，每段 ≤15s）。 |
+| `--voice-asset <asset-id>` | `--ref-audio` 的语义化别名，专用于音色锁定。 |
+| `--last-frame-url <url>` | 指定尾帧（首尾帧驱动）。 |
+| `--no-audio` | 禁用同步音频生成。 |
+| `--quality 480p/720p/1080p` | 指定输出分辨率。 |
+
+连续生成 + 音色锁定的一键命令：
+
+```bash
+changdu sequential-generate \
+  --prompt-dir ./单集制作/EP001/ \
+  --asset <角色三视图ID> --asset <场景ID> \
+  --continuity-mode ref_video \
+  --voice-from-clip 1 --voice-group-id <主角素材组ID> \
+  --ratio 16:9 --duration 15 \
+  --prompt-header "图片1是女主三视图，图片2是场景。视频1 是前段尾段，仅做妆造参考。音轨1 锁音色。"
 ```
 
 ## 任务查询
@@ -85,4 +109,5 @@ changdu query_result --submit_id <任务ID> --wait --output "结果.mp4"
 
 - 鉴权失败：检查 `CHANGDU_ARK_API_KEY`。
 - 端点无权限：检查对应 `CHANGDU_SEEDREAM_ENDPOINT` / `CHANGDU_SEEDANCE_ENDPOINT` 是否可用。
-- 多图一致性差：固定参考图顺序，且 prompt 明确“图1/图2/图3”角色关系。
+- 多图一致性差：固定参考图/视频/音频顺序，prompt 明确"图1/图2/视频1/音轨1"指代关系；MAKEUP/VOICE 类穿帮请配合 `--ref-video`+`--voice-asset` 双锚定。
+- TOS 未配置：传入本地视频/音频做参考时需要 `VOLC_ACCESSKEY` / `VOLC_SECRETKEY` / `CHANGDU_TOS_BUCKET`。

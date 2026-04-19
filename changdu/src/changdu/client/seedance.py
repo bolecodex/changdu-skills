@@ -37,24 +37,48 @@ class SeedanceClient:
 
         file_url = None
         last_frame_url = None
+        audio_url = None
+        video_duration: float | None = None
         content = data.get("content") or {}
         if isinstance(content, dict):
             file_url = content.get("video_url")
             last_frame_url = content.get("last_frame_url")
-            if not file_url:
-                video_obj = content.get("video") or {}
-                if isinstance(video_obj, dict):
+            audio_url = content.get("audio_url")
+            video_obj = content.get("video") or {}
+            if isinstance(video_obj, dict):
+                if not file_url:
                     file_url = video_obj.get("url")
-                    if not last_frame_url:
-                        last_frame_url = video_obj.get("last_frame_url")
+                if not last_frame_url:
+                    last_frame_url = video_obj.get("last_frame_url")
+                if not audio_url:
+                    audio_url = video_obj.get("audio_url")
+                duration_raw = video_obj.get("duration") or video_obj.get("video_duration")
+                if duration_raw is not None:
+                    try:
+                        video_duration = float(duration_raw)
+                    except (TypeError, ValueError):
+                        video_duration = None
+            audio_obj = content.get("audio") or {}
+            if isinstance(audio_obj, dict) and not audio_url:
+                audio_url = audio_obj.get("url")
         file_url = file_url or data.get("url")
         last_frame_url = last_frame_url or data.get("last_frame_url")
+        audio_url = audio_url or data.get("audio_url")
+        if video_duration is None:
+            duration_raw = data.get("duration") or data.get("video_duration")
+            if duration_raw is not None:
+                try:
+                    video_duration = float(duration_raw)
+                except (TypeError, ValueError):
+                    video_duration = None
 
         return TaskStatusResponse(
             task_id=task_id,
             status=status,
             file_url=file_url,
             last_frame_url=last_frame_url,
+            audio_url=audio_url,
+            video_duration=video_duration,
             fail_reason=fail_reason,
             request_id=request_id,
         )

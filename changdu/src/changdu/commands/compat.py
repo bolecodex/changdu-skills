@@ -58,6 +58,336 @@ def _emit(obj: AppContext, payload: dict[str, Any], pretty_lines: list[str]) -> 
             typer.echo(line)
 
 
+# ── Media reference resolution ─────────────────────────────────────────────
+# Reference videos and audios cannot be inlined as data URLs (size & API
+# restrictions), so local files are uploaded to TOS first. Asset IDs are
+# converted to `asset://...` URIs. Plain URLs are passed through.
+def _resolve_media_ref(value: str | Path, *, kind: str) -> str:
+    """Normalise a video/audio reference into an URL the Ark API can fetch.
+
+    Accepts:
+    - A local file path → uploaded to TOS, returns the public URL.
+    - An `asset-...` ID or `asset://...` URI → returned as `asset://<id>`.
+    - An `http(s)://` URL → returned as-is.
+    """
+
+    text = str(value).strip()
+    if not text:
+        raise typer.BadParameter(f"empty {kind} reference")
+
+    if text.startswith("asset://"):
+        return text
+    if text.startswith("asset-"):
+        return f"asset://{text}"
+    if text.startswith("http://") or text.startswith("https://"):
+        return text
+
+    path = Path(text)
+    if not path.exists():
+        raise typer.BadParameter(f"{kind} reference not found locally and not a URL/asset id: {text}")
+
+    return _upload_to_tos(path, kind=kind)
+
+
+def _upload_to_tos(path: Path, *, kind: str) -> str:
+    import os
+
+    from changdu.client.tos_upload import upload_file
+
+    ak = os.getenv("VOLC_ACCESSKEY") or os.getenv("CHANGDU_TOS_AK")
+    sk = os.getenv("VOLC_SECRETKEY") or os.getenv("CHANGDU_TOS_SK")
+    bucket = os.getenv("CHANGDU_TOS_BUCKET")
+    endpoint = os.getenv("CHANGDU_TOS_ENDPOINT", "tos-cn-beijing.volces.com")
+    region = os.getenv("CHANGDU_TOS_REGION", "cn-beijing")
+    if not ak or not sk or not bucket:
+        raise typer.BadParameter(
+            f"传入本地{kind}文件需要配置 TOS：VOLC_ACCESSKEY / VOLC_SECRETKEY / CHANGDU_TOS_BUCKET"
+        )
+    typer.echo(f"  正在上传 {kind}: {path.name} → TOS ...")
+    result = upload_file(
+        file_path=path,
+        bucket=bucket,
+        key=f"refs/{kind}/{path.name}",
+        ak=ak,
+        sk=sk,
+        endpoint=endpoint,
+        region=region,
+        public=True,
+    )
+    typer.echo(f"  TOS URL: {result.url}")
+    return result.url
+
+
+def _extract_tail_segment(video_path: Path, output_path: Path, tail_seconds: float = 5.0) -> Path:
+    """Extract the trailing N seconds of a video (audio + video copy).
+
+    Used to feed the previous clip's tail into the next clip as a
+    `reference_video` to lock visual continuity.
+    """
+
+    import subprocess
+
+    if not video_path.exists():
+        raise FileNotFoundError(f"video not found: {video_path}")
+
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(video_path)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    try:
+        duration = float(probe.stdout.strip()) if probe.stdout.strip() else 15.0
+    except ValueError:
+        duration = 15.0
+
+    tail_seconds = max(2.0, min(tail_seconds, 15.0, duration))
+    start = max(0.0, duration - tail_seconds)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{start:.2f}",
+        "-i", str(video_path),
+        "-t", f"{tail_seconds:.2f}",
+        "-c", "copy",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0 or not output_path.exists():
+        raise RuntimeError(f"ffmpeg tail extract failed: {result.stderr[-300:]}")
+    return output_path
+
+
+def _extract_voice_audio(
+    video_path: Path,
+    output_path: Path,
+    *,
+    start: float = 0.0,
+    duration: float = 8.0,
+    fmt: str = "mp3",
+) -> Path:
+    """Extract a short audio clip from a video, suitable for use as a
+    Seedance `reference_audio` voice anchor.
+
+    Auto-clamps ``start`` and ``duration`` to fit within the actual video
+    length so that callers asking for e.g. 6s+8s on a 5s clip still get a
+    valid extract instead of a near-empty file rejected by ARK.
+    """
+
+    import subprocess
+
+    if not video_path.exists():
+        raise FileNotFoundError(f"video not found: {video_path}")
+
+    video_duration = _probe_duration(video_path, default=15.0)
+    if video_duration <= 1.5:
+        raise RuntimeError(
+            f"video duration {video_duration:.2f}s too short to extract a voice "
+            "anchor (need >= 1.8s)."
+        )
+
+    if start >= video_duration - 1.5:
+        new_start = max(0.0, video_duration - max(2.0, duration) - 0.2)
+        start = new_start
+    available = max(1.8, video_duration - start - 0.05)
+    duration = max(1.8, min(duration, available, 15.0))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if fmt.lower() == "wav":
+        codec_args = ["-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2"]
+    else:
+        codec_args = ["-vn", "-acodec", "libmp3lame", "-q:a", "2", "-ac", "2"]
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{start:.2f}",
+        "-i", str(video_path),
+        "-t", f"{duration:.2f}",
+        *codec_args,
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError(f"ffmpeg voice extract failed: {result.stderr[-300:]}")
+    return output_path
+
+
+def _probe_duration(path: Path, default: float = 5.0) -> float:
+    """Probe a media file's duration in seconds via ffprobe; returns ``default`` on error."""
+
+    import subprocess
+
+    if not path.exists():
+        return default
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    raw = probe.stdout.strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _build_concat_filter_complex(
+    durations: list[float],
+    *,
+    crossfade: float = 0.0,
+    normalize_audio: bool = False,
+    bgm_enabled: bool = False,
+    bgm_volume: float = 0.25,
+    bgm_ducking: bool = True,
+    bgm_fadein: float = 1.5,
+    bgm_fadeout: float = 2.0,
+) -> tuple[str, str, str, float]:
+    """Compose a ``filter_complex`` for the upgraded ``clip-concat`` pipeline.
+
+    Pipeline (per option):
+
+    - ``crossfade>0`` : pairwise ``xfade`` (video) + ``acrossfade`` (audio)
+    - ``crossfade==0`` : ``concat`` filter (no transition) — only used when
+      another option (loudnorm/BGM) forces re-encode anyway
+    - ``normalize_audio`` : append ``loudnorm=I=-16:LRA=11:TP=-1.5``
+    - ``bgm_enabled`` : split clip audio, fade/volume the BGM, optionally
+      ``sidechaincompress`` (ducking) it by clip audio, then ``amix``
+
+    Returns ``(filter_complex, video_label, audio_label, total_duration)``.
+    The ``total_duration`` is the post-crossfade output length, useful for
+    BGM fade-out scheduling outside this helper.
+    """
+
+    if not durations:
+        raise ValueError("durations must contain at least one clip duration")
+
+    n = len(durations)
+    chains: list[str] = []
+
+    if n == 1:
+        v_label = "[0:v]"
+        a_label = "[0:a]"
+        total = durations[0]
+    elif crossfade > 0:
+        offset = 0.0
+        prev_v = "[0:v]"
+        prev_a = "[0:a]"
+        for i in range(1, n):
+            offset += durations[i - 1] - crossfade
+            v_next = f"[v{i:02d}]"
+            a_next = f"[a{i:02d}]"
+            chains.append(
+                f"{prev_v}[{i}:v]xfade=transition=fade:duration={crossfade:.3f}:"
+                f"offset={offset:.3f}{v_next}"
+            )
+            chains.append(
+                f"{prev_a}[{i}:a]acrossfade=d={crossfade:.3f}:c1=tri:c2=tri{a_next}"
+            )
+            prev_v = v_next
+            prev_a = a_next
+        v_label = prev_v
+        a_label = prev_a
+        total = sum(durations) - (n - 1) * crossfade
+    else:
+        v_inputs = "".join(f"[{i}:v]" for i in range(n))
+        a_inputs = "".join(f"[{i}:a]" for i in range(n))
+        chains.append(f"{v_inputs}{a_inputs}concat=n={n}:v=1:a=1[vcat][acat]")
+        v_label = "[vcat]"
+        a_label = "[acat]"
+        total = sum(durations)
+
+    if normalize_audio:
+        chains.append(f"{a_label}loudnorm=I=-16:LRA=11:TP=-1.5[anorm]")
+        a_label = "[anorm]"
+
+    if bgm_enabled:
+        bgm_idx = n
+        chains.append(f"{a_label}asplit=2[amain][asc]")
+        bgm_filters = [f"volume={bgm_volume:.3f}"]
+        if bgm_fadein > 0:
+            bgm_filters.append(f"afade=t=in:st=0:d={bgm_fadein:.3f}")
+        if bgm_fadeout > 0:
+            fade_out_start = max(0.0, total - bgm_fadeout)
+            bgm_filters.append(
+                f"afade=t=out:st={fade_out_start:.3f}:d={bgm_fadeout:.3f}"
+            )
+        chains.append(f"[{bgm_idx}:a]{','.join(bgm_filters)}[bgmprep]")
+        if bgm_ducking:
+            chains.append(
+                "[bgmprep][asc]sidechaincompress=threshold=0.05:ratio=8:"
+                "attack=200:release=1000[bgmducked]"
+            )
+            chains.append(
+                "[amain][bgmducked]amix=inputs=2:duration=first:dropout_transition=0[afinal]"
+            )
+        else:
+            chains.append(
+                "[amain][bgmprep]amix=inputs=2:duration=first:dropout_transition=0[afinal]"
+            )
+        a_label = "[afinal]"
+
+    return ";".join(chains), v_label, a_label, total
+
+
+def _run_concat_with_filters(
+    sources: list[Path],
+    output: Path,
+    *,
+    crossfade: float,
+    normalize_audio: bool,
+    bgm: Path | None,
+    bgm_volume: float,
+    bgm_ducking: bool,
+    bgm_fadein: float,
+    bgm_fadeout: float,
+    timeout_s: int = 600,
+) -> tuple[float, str]:
+    """Run the upgraded concat pipeline (re-encode) and return ``(out_duration, ffmpeg_cmd)``."""
+
+    import subprocess
+
+    durations = [_probe_duration(s) for s in sources]
+    fc, vout, aout, _total = _build_concat_filter_complex(
+        durations,
+        crossfade=crossfade,
+        normalize_audio=normalize_audio,
+        bgm_enabled=bgm is not None,
+        bgm_volume=bgm_volume,
+        bgm_ducking=bgm_ducking,
+        bgm_fadein=bgm_fadein,
+        bgm_fadeout=bgm_fadeout,
+    )
+
+    cmd: list[str] = ["ffmpeg", "-y"]
+    for src in sources:
+        cmd.extend(["-i", str(src)])
+    if bgm is not None:
+        cmd.extend(["-i", str(bgm)])
+    cmd.extend([
+        "-filter_complex", fc,
+        "-map", vout,
+        "-map", aout,
+        "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k",
+        "-shortest",
+        str(output),
+    ])
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+    if result.returncode != 0 or not output.exists():
+        raise RuntimeError(f"ffmpeg concat (filter_complex) failed: {result.stderr[-400:]}")
+    return _probe_duration(output), " ".join(cmd)
+
+
 def register_compat_commands(app: typer.Typer) -> None:
     @app.command("version", help="显示版本信息。")
     def version() -> None:
@@ -99,6 +429,11 @@ def register_compat_commands(app: typer.Typer) -> None:
         output: Path | None = typer.Option(None, "--output", help="等待完成时的视频保存路径。"),
         return_last_frame: bool = typer.Option(False, "--return-last-frame", help="返回生成视频的尾帧URL（用于连续生成）。"),
         first_frame_url: str | None = typer.Option(None, "--first-frame-url", help="指定首帧图片URL（来自上一 clip 的尾帧）。"),
+        last_frame_url: str | None = typer.Option(None, "--last-frame-url", help="指定尾帧图片URL（首尾帧驱动模式）。"),
+        ref_video: list[str] = typer.Option([], "--ref-video", help="参考视频（本地路径/URL/asset ID），最多 3 个。"),
+        ref_audio: list[str] = typer.Option([], "--ref-audio", help="参考音频（本地路径/URL/asset ID），最多 3 段。"),
+        no_audio: bool = typer.Option(False, "--no-audio", help="禁用同步音频生成。"),
+        quality: str | None = typer.Option(None, "--quality", help="视频分辨率：480p/720p/1080p（默认随端点）。"),
     ) -> None:
         _submit_video_compat(
             ctx=ctx,
@@ -113,13 +448,18 @@ def register_compat_commands(app: typer.Typer) -> None:
             run_name="text2video",
             return_last_frame=return_last_frame,
             first_frame_url=first_frame_url,
+            last_frame_url=last_frame_url,
+            ref_videos=ref_video,
+            ref_audios=ref_audio,
+            generate_audio=not no_audio,
+            quality=quality,
         )
 
-    @app.command("multimodal2video", help="多图参考生成视频（支持 Asset 素材引用）。")
+    @app.command("multimodal2video", help="多模态参考生成视频（图片 + 视频 + 音频，支持 Asset 素材引用）。")
     def multimodal2video(
         ctx: typer.Context,
         image: list[Path] = typer.Option([], "--image", help="参考图，可重复传入。"),
-        asset: list[str] = typer.Option([], "--asset", help="Asset 素材ID，可重复传入（自动转为 asset:// 引用）。"),
+        asset: list[str] = typer.Option([], "--asset", help="Asset 素材ID（图片/视频/音频通用），自动转 asset:// 引用。"),
         prompt: str = typer.Option("", "--prompt", help="提示词。"),
         ratio: str = typer.Option("16:9", "--ratio", help="视频比例。"),
         duration: int = typer.Option(5, "--duration", help="时长（秒）。"),
@@ -128,6 +468,11 @@ def register_compat_commands(app: typer.Typer) -> None:
         output: Path | None = typer.Option(None, "--output", help="等待完成时的视频保存路径。"),
         return_last_frame: bool = typer.Option(False, "--return-last-frame", help="返回生成视频的尾帧URL（用于连续生成）。"),
         first_frame_url: str | None = typer.Option(None, "--first-frame-url", help="指定首帧图片URL（来自上一 clip 的尾帧）。"),
+        last_frame_url: str | None = typer.Option(None, "--last-frame-url", help="指定尾帧图片URL（首尾帧驱动）。"),
+        ref_video: list[str] = typer.Option([], "--ref-video", help="参考视频（本地路径/URL/asset ID），最多 3 个，用于动作/运镜/外观连贯参考。"),
+        ref_audio: list[str] = typer.Option([], "--ref-audio", help="参考音频（本地路径/URL/asset ID），最多 3 段，用于音色/台词/BGM 锁定。"),
+        no_audio: bool = typer.Option(False, "--no-audio", help="禁用同步音频生成。"),
+        quality: str | None = typer.Option(None, "--quality", help="视频分辨率：480p/720p/1080p。"),
     ) -> None:
         _submit_video_compat(
             ctx=ctx,
@@ -142,6 +487,11 @@ def register_compat_commands(app: typer.Typer) -> None:
             run_name="multimodal2video",
             return_last_frame=return_last_frame,
             first_frame_url=first_frame_url,
+            last_frame_url=last_frame_url,
+            ref_videos=ref_video,
+            ref_audios=ref_audio,
+            generate_audio=not no_audio,
+            quality=quality,
         )
 
     @app.command("image2video", help="单图生成视频（支持 Asset 素材引用）。")
@@ -157,6 +507,11 @@ def register_compat_commands(app: typer.Typer) -> None:
         output: Path | None = typer.Option(None, "--output", help="等待完成时的视频保存路径。"),
         return_last_frame: bool = typer.Option(False, "--return-last-frame", help="返回生成视频的尾帧URL（用于连续生成）。"),
         first_frame_url: str | None = typer.Option(None, "--first-frame-url", help="指定首帧图片URL（来自上一 clip 的尾帧）。"),
+        last_frame_url: str | None = typer.Option(None, "--last-frame-url", help="指定尾帧图片URL（首尾帧驱动）。"),
+        ref_video: list[str] = typer.Option([], "--ref-video", help="参考视频（本地路径/URL/asset ID）。"),
+        ref_audio: list[str] = typer.Option([], "--ref-audio", help="参考音频（本地路径/URL/asset ID）。"),
+        no_audio: bool = typer.Option(False, "--no-audio", help="禁用同步音频生成。"),
+        quality: str | None = typer.Option(None, "--quality", help="视频分辨率：480p/720p/1080p。"),
     ) -> None:
         images = [image] if image else []
         asset_ids = [asset] if asset else []
@@ -176,6 +531,11 @@ def register_compat_commands(app: typer.Typer) -> None:
             run_name="image2video",
             return_last_frame=return_last_frame,
             first_frame_url=first_frame_url,
+            last_frame_url=last_frame_url,
+            ref_videos=ref_video,
+            ref_audios=ref_audio,
+            generate_audio=not no_audio,
+            quality=quality,
         )
 
     @app.command("multiframe2video", help="多图叙事生成视频（支持 Asset 素材引用）。")
@@ -191,6 +551,11 @@ def register_compat_commands(app: typer.Typer) -> None:
         output: Path | None = typer.Option(None, "--output", help="等待完成时的视频保存路径。"),
         return_last_frame: bool = typer.Option(False, "--return-last-frame", help="返回生成视频的尾帧URL（用于连续生成）。"),
         first_frame_url: str | None = typer.Option(None, "--first-frame-url", help="指定首帧图片URL（来自上一 clip 的尾帧）。"),
+        last_frame_url: str | None = typer.Option(None, "--last-frame-url", help="指定尾帧图片URL（首尾帧驱动）。"),
+        ref_video: list[str] = typer.Option([], "--ref-video", help="参考视频（本地路径/URL/asset ID）。"),
+        ref_audio: list[str] = typer.Option([], "--ref-audio", help="参考音频（本地路径/URL/asset ID）。"),
+        no_audio: bool = typer.Option(False, "--no-audio", help="禁用同步音频生成。"),
+        quality: str | None = typer.Option(None, "--quality", help="视频分辨率：480p/720p/1080p。"),
     ) -> None:
         _submit_video_compat(
             ctx=ctx,
@@ -205,6 +570,11 @@ def register_compat_commands(app: typer.Typer) -> None:
             run_name="multiframe2video",
             return_last_frame=return_last_frame,
             first_frame_url=first_frame_url,
+            last_frame_url=last_frame_url,
+            ref_videos=ref_video,
+            ref_audios=ref_audio,
+            generate_audio=not no_audio,
+            quality=quality,
         )
 
     @app.command("frames2video", help="首尾帧插值生成视频。")
@@ -563,7 +933,7 @@ def register_compat_commands(app: typer.Typer) -> None:
         for g in groups:
             typer.echo(f"  {g.id}  名称={g.name}  描述={g.description or '-'}")
 
-    @app.command("sequential-generate", help="按顺序生成多个视频片段，自动用前一个视频的尾帧衔接下一个，保证连贯性。")
+    @app.command("sequential-generate", help="按顺序生成多个视频片段，默认用前一 clip 的尾段做 reference_video + 可选音色锁定，保证人物/场景/音色的连贯。")
     def sequential_generate(
         ctx: typer.Context,
         prompt_dir: Path = typer.Option(..., "--prompt-dir", help="包含 视频_ClipXXX.prompt.txt 的目录。"),
@@ -573,14 +943,48 @@ def register_compat_commands(app: typer.Typer) -> None:
         duration: int = typer.Option(15, "--duration", help="每个 clip 的时长（秒）。"),
         model: str | None = typer.Option(None, "--model", help="覆盖视频模型/端点 ID。"),
         output_dir: Path = typer.Option(None, "--output-dir", help="视频输出目录（默认同 prompt-dir）。"),
-        extract_keyframes: bool = typer.Option(True, "--extract-keyframes/--no-keyframes", help="是否从前一 clip 抽取关键帧作为额外参考。"),
         prompt_header: str = typer.Option("", "--prompt-header", help="每个 clip 提示词前缀（如角色/场景说明）。"),
+        continuity_mode: str = typer.Option(
+            "ref_video",
+            "--continuity-mode",
+            help=(
+                "衔接模式：first_frame（前段尾帧做首帧）/ ref_video（前段尾段做参考视频，推荐）/ "
+                "auto（先 ref_video，被 ARK 拒绝时自动降级到 first_frame）。"
+                "API 不允许同一请求同时塞 first_frame 和 reference_video。"
+                "（旧值 both 等价于 auto，已保留兼容。）"
+            ),
+        ),
+        prev_tail_seconds: float = typer.Option(5.0, "--prev-tail-seconds", help="ref_video 模式下从前一 clip 抽取的尾段时长（秒）。"),
+        extract_keyframes: bool = typer.Option(False, "--extract-keyframes/--no-keyframes", help="兼容旧行为：从前一 clip 抽中/尾帧作为额外参考图。"),
+        voice_asset: str | None = typer.Option(None, "--voice-asset", help="音色样本 asset ID（如 asset-xxxx），每个 clip 都会附加做 reference_audio。"),
+        voice_from_clip: int | None = typer.Option(
+            None,
+            "--voice-from-clip",
+            help="第 N 个 clip 完成后自动提取主角音色（默认提取第 6-12 秒），上传入库后从 N+1 起所有后续 clip 自动锁音色。",
+        ),
+        voice_group_id: str | None = typer.Option(None, "--voice-group-id", help="--voice-from-clip 自动入库时使用的素材组ID（必填条件）。"),
+        voice_clip_start: float = typer.Option(6.0, "--voice-clip-start", help="--voice-from-clip 提取音色的起始时间（秒）。"),
+        voice_clip_duration: float = typer.Option(8.0, "--voice-clip-duration", help="--voice-from-clip 提取音色的时长（秒，2-15）。"),
+        ref_video_extra: list[str] = typer.Option([], "--ref-video", help="额外参考视频（每个 clip 共享），最多 3。"),
+        ref_audio_extra: list[str] = typer.Option([], "--ref-audio", help="额外参考音频（每个 clip 共享），最多 3。"),
+        no_audio: bool = typer.Option(False, "--no-audio", help="禁用同步音频生成。"),
+        quality: str | None = typer.Option(None, "--quality", help="视频分辨率：480p/720p/1080p。"),
     ) -> None:
         import re
         from changdu.utils import extract_keyframes as _extract_kf
 
         obj: AppContext = ctx.obj
         out_dir = output_dir or prompt_dir
+
+        if continuity_mode not in {"first_frame", "ref_video", "both", "auto"}:
+            typer.echo("错误：--continuity-mode 必须是 first_frame / ref_video / auto 之一。", err=True)
+            raise typer.Exit(1)
+        if continuity_mode == "both":
+            continuity_mode = "auto"
+
+        if voice_from_clip and not voice_group_id:
+            typer.echo("错误：--voice-from-clip 需要同时传入 --voice-group-id。", err=True)
+            raise typer.Exit(1)
 
         prompt_files = sorted(
             [f for f in prompt_dir.iterdir() if re.match(r"视频_Clip\d+\.prompt\.txt$", f.name)],
@@ -602,88 +1006,301 @@ def register_compat_commands(app: typer.Typer) -> None:
         if already_done > 0:
             typer.echo(f"发现 {already_done} 个已完成的 clip，从第 {already_done + 1} 个开始续做")
 
-        typer.echo(f"共发现 {len(prompt_files)} 个 clip 待生成，将按顺序逐个生成（尾帧衔接模式）")
+        typer.echo(
+            f"共发现 {len(prompt_files)} 个 clip 待生成；continuity={continuity_mode}, "
+            f"voice_asset={'有' if voice_asset else ('待提取' if voice_from_clip else '无')}"
+        )
+
+        shared_audios_base: list[str] = list(ref_audio_extra)
+        if voice_asset:
+            shared_audios_base.append(voice_asset)
 
         last_frame_url: str | None = None
+        last_video_path: Path | None = None
+        prev_label: str = ""
+        active_voice_asset: str | None = voice_asset
+
         for idx, pf in enumerate(prompt_files):
             clip_num = re.search(r"Clip(\d+)", pf.name)
             clip_label = clip_num.group(0) if clip_num else f"Clip{idx+1:03d}"
+            clip_index = int(clip_num.group(1)) if clip_num else (idx + 1)
             clip_prompt = pf.read_text(encoding="utf-8").strip()
             full_prompt = f"{prompt_header}{clip_prompt}" if prompt_header else clip_prompt
             clip_output = out_dir / f"视频_{clip_label}.mp4"
 
             if clip_output.exists() and idx < already_done:
                 typer.echo(f"\n{'='*50}")
-                typer.echo(f"[{idx+1}/{len(prompt_files)}] {clip_label} 已存在，跳过")
+                typer.echo(f"[{idx+1}/{len(prompt_files)}] {clip_label} 已存在，跳过生成（仍补做 voice/last_frame 提取）")
                 prev_label = clip_label
+                last_video_path = clip_output
                 last_frame_url = None
+
+                lf_path = clip_output.with_suffix(".lastframe.jpg")
+                if not lf_path.exists():
+                    try:
+                        import subprocess
+                        subprocess.run(
+                            [
+                                "ffmpeg", "-y", "-sseof", "-0.05", "-i", str(clip_output),
+                                "-frames:v", "1", "-q:v", "2", str(lf_path),
+                            ],
+                            capture_output=True, text=True, timeout=60,
+                        )
+                    except Exception as exc:
+                        typer.echo(f"  警告：补抽 lastframe 失败：{exc}", err=True)
+                if lf_path.exists():
+                    try:
+                        last_frame_url = _upload_to_tos(lf_path, kind="image")
+                        typer.echo(f"  已上传 lastframe 用于后续 fallback：{last_frame_url}")
+                    except Exception as exc:
+                        typer.echo(f"  警告：lastframe 上传 TOS 失败（fallback 不可用）：{exc}", err=True)
+
+                if (
+                    voice_from_clip is not None
+                    and clip_index == voice_from_clip
+                    and not active_voice_asset
+                ):
+                    typer.echo(
+                        f"  正在从已存在的 {clip_label} 提取主角音色样本"
+                        f"（{voice_clip_start:.1f}s 起 {voice_clip_duration:.1f}s）..."
+                    )
+                    fmt_urls: dict[str, str] = {}
+                    for fmt in ("wav", "mp3"):
+                        voice_path = out_dir / "_voices" / f"voice_from_{clip_label}.{fmt}"
+                        try:
+                            _extract_voice_audio(
+                                clip_output, voice_path,
+                                start=voice_clip_start, duration=voice_clip_duration, fmt=fmt,
+                            )
+                            fmt_urls[fmt] = _upload_to_tos(voice_path, kind="audio")
+                        except Exception as exc:
+                            typer.echo(f"  警告：音色抽取/上传失败（fmt={fmt}）：{exc}", err=True)
+                            continue
+                        try:
+                            assets_client = _build_assets_client()
+                            asset_obj = assets_client.create_asset(
+                                group_id=voice_group_id, url=fmt_urls[fmt],
+                                asset_type="Audio", name=f"voice-from-{clip_label}",
+                            )
+                            asset_obj = assets_client.wait_for_active(asset_obj.id)
+                            typer.echo(
+                                f"  音色已入库（{fmt}）: {asset_obj.id}（仅记录，"
+                                "实际 reference_audio 走 wav TOS URL 直链）"
+                            )
+                        except Exception as exc:
+                            typer.echo(f"  说明：asset 入库失败（fmt={fmt}）：{exc}（不影响后续）", err=True)
+                    if "wav" in fmt_urls:
+                        active_voice_asset = fmt_urls["wav"]
+                        typer.echo(f"  使用 wav TOS URL 作为 reference_audio：{active_voice_asset}")
+                    elif "mp3" in fmt_urls:
+                        active_voice_asset = fmt_urls["mp3"]
+                        typer.echo(
+                            f"  仅有 mp3 TOS URL：{active_voice_asset}（兼容性差，可能被拒）",
+                            err=True,
+                        )
                 continue
 
             typer.echo(f"\n{'='*50}")
             typer.echo(f"[{idx+1}/{len(prompt_files)}] 正在生成 {clip_label} ...")
 
+            ff_url: str | None = None
+            videos_for_this: list[str] = list(ref_video_extra)
             extra_ref_images: list[Path] = []
-            if idx > 0 and not last_frame_url and extract_keyframes and not asset:
-                prev_clip = out_dir / f"视频_{prev_label}.mp4"
-                if prev_clip.exists():
-                    typer.echo(f"  从 {prev_label} 抽取关键帧 ...")
-                    kf_dir = out_dir / "keyframes"
-                    extra_ref_images = _extract_kf(prev_clip, kf_dir)
-                    typer.echo(f"  抽取到 {len(extra_ref_images)} 帧参考图")
-            elif idx > 0 and not last_frame_url and asset:
-                typer.echo(f"  使用 Asset 素材模式，依赖角色/场景素材保持一致性")
+            tail_for_fallback: Path | None = None
 
-            resolved_first_frame = last_frame_url
-            if asset:
-                resolved_first_frame = None
-                if idx > 0:
-                    typer.echo(f"  Asset模式：跳过首帧衔接（API不支持混合），依赖素材+提示词保持一致性")
+            if idx > 0 and continuity_mode == "first_frame" and last_frame_url:
+                ff_url = last_frame_url
+                typer.echo("  首帧URL衔接（first_frame）")
+
+            if (
+                idx > 0
+                and continuity_mode in {"ref_video", "auto"}
+                and last_video_path
+                and last_video_path.exists()
+            ):
+                tail_dir = out_dir / "_tails"
+                tail_path = tail_dir / f"{last_video_path.stem}_tail.mp4"
+                try:
+                    _extract_tail_segment(last_video_path, tail_path, tail_seconds=prev_tail_seconds)
+                    videos_for_this.append(str(tail_path))
+                    tail_for_fallback = tail_path
+                    typer.echo(
+                        f"  ref_video 衔接：{last_video_path.name} → 尾段 {prev_tail_seconds:.1f}s"
+                    )
+                except Exception as exc:
+                    typer.echo(f"  警告：尾段抽取失败：{exc}", err=True)
+
+            if (
+                idx > 0
+                and extract_keyframes
+                and continuity_mode == "first_frame"
+                and not asset
+                and not last_frame_url
+            ):
+                prev_clip_path = out_dir / f"视频_{prev_label}.mp4"
+                if prev_clip_path.exists():
+                    typer.echo(f"  兼容旧逻辑：从 {prev_label} 抽取关键帧 ...")
+                    kf_dir = out_dir / "keyframes"
+                    extra_ref_images = _extract_kf(prev_clip_path, kf_dir)
+                    typer.echo(f"  抽取到 {len(extra_ref_images)} 帧参考图")
+
+            audios_for_this: list[str] = list(shared_audios_base)
+            if active_voice_asset and active_voice_asset not in audios_for_this:
+                audios_for_this.append(active_voice_asset)
 
             all_images = list(image) + extra_ref_images
 
-            result = _submit_video_compat(
-                ctx=ctx,
-                prompt=full_prompt,
-                images=all_images,
-                asset_ids=asset,
-                ratio=ratio,
-                duration=duration,
-                model=model,
-                wait=True,
-                output=clip_output,
-                run_name=f"sequential-{clip_label}",
-                return_last_frame=True,
-                first_frame_url=resolved_first_frame,
-            )
+            try:
+                result = _submit_video_compat(
+                    ctx=ctx,
+                    prompt=full_prompt,
+                    images=all_images,
+                    asset_ids=asset,
+                    ratio=ratio,
+                    duration=duration,
+                    model=model,
+                    wait=True,
+                    output=clip_output,
+                    run_name=f"sequential-{clip_label}",
+                    return_last_frame=True,
+                    first_frame_url=ff_url,
+                    ref_videos=videos_for_this,
+                    ref_audios=audios_for_this,
+                    generate_audio=not no_audio,
+                    quality=quality,
+                )
+            except Exception as exc:
+                msg = str(exc)
+                fallback_triggers = (
+                    "may contain real person",
+                    "first/last frame content cannot be mixed",
+                    "Sensitive",
+                    "InvalidParameter",
+                    "FormatUnsupported",
+                    "audio probe err",
+                    "is not found",
+                    "is not valid",
+                )
+                can_fallback = (
+                    continuity_mode == "auto"
+                    and idx > 0
+                    and last_frame_url
+                    and any(t in msg for t in fallback_triggers)
+                )
+                if not can_fallback:
+                    raise
+                typer.echo(
+                    f"  警告：带 ref_video/ref_audio 的提交被拒（{msg.splitlines()[0][:140]}），"
+                    "降级为 first_frame_url 模式重试（清空 reference_image/video/audio）..."
+                )
+                result = _submit_video_compat(
+                    ctx=ctx,
+                    prompt=full_prompt,
+                    images=[],
+                    asset_ids=[],
+                    ratio=ratio,
+                    duration=duration,
+                    model=model,
+                    wait=True,
+                    output=clip_output,
+                    run_name=f"sequential-{clip_label}-fallback",
+                    return_last_frame=True,
+                    first_frame_url=last_frame_url,
+                    ref_videos=[],
+                    ref_audios=[],
+                    generate_audio=not no_audio,
+                    quality=quality,
+                )
 
             if result and result.last_frame_url:
                 last_frame_url = result.last_frame_url
                 typer.echo(f"  尾帧URL已缓存，将用于 {clip_label} → 下一 clip 衔接")
             else:
                 last_frame_url = None
+            if clip_output.exists():
+                last_video_path = clip_output
+
+            if (
+                voice_from_clip is not None
+                and clip_index == voice_from_clip
+                and not active_voice_asset
+                and last_video_path
+                and last_video_path.exists()
+            ):
+                typer.echo(
+                    f"  正在从 {clip_label} 提取主角音色样本（{voice_clip_start:.1f}s 起 {voice_clip_duration:.1f}s）..."
+                )
+                fmt_urls: dict[str, str] = {}
+                asset_id_logged: str | None = None
+                for fmt in ("wav", "mp3"):
+                    voice_path = out_dir / "_voices" / f"voice_from_{clip_label}.{fmt}"
+                    try:
+                        _extract_voice_audio(
+                            last_video_path,
+                            voice_path,
+                            start=voice_clip_start,
+                            duration=voice_clip_duration,
+                            fmt=fmt,
+                        )
+                        fmt_urls[fmt] = _upload_to_tos(voice_path, kind="audio")
+                    except Exception as exc:
+                        typer.echo(f"  警告：音色抽取/上传失败（fmt={fmt}）：{exc}", err=True)
+                        continue
+                    try:
+                        assets_client = _build_assets_client()
+                        asset_obj = assets_client.create_asset(
+                            group_id=voice_group_id,
+                            url=fmt_urls[fmt],
+                            asset_type="Audio",
+                            name=f"voice-from-{clip_label}",
+                        )
+                        asset_obj = assets_client.wait_for_active(asset_obj.id)
+                        asset_id_logged = asset_obj.id
+                        typer.echo(
+                            f"  音色已入库（{fmt}）: {asset_obj.id} → {asset_obj.asset_url}（仅记录，"
+                            "实际 reference_audio 走 wav TOS URL 直链）"
+                        )
+                    except Exception as exc:
+                        typer.echo(f"  说明：asset 入库失败（fmt={fmt}）：{exc}（不影响后续，wav TOS URL 直接做 reference_audio）", err=True)
+                if "wav" in fmt_urls:
+                    active_voice_asset = fmt_urls["wav"]
+                    typer.echo(f"  使用 wav TOS URL 作为 reference_audio：{active_voice_asset}")
+                elif "mp3" in fmt_urls:
+                    active_voice_asset = fmt_urls["mp3"]
+                    typer.echo(
+                        f"  仅有 mp3 TOS URL：{active_voice_asset}（Seedance 对 mp3 audio_url 兼容性差，可能被拒）",
+                        err=True,
+                    )
 
             prev_label = clip_label
 
         typer.echo(f"\n{'='*50}")
         typer.echo(f"全部 {len(prompt_files)} 个 clip 生成完毕！输出目录: {out_dir}")
+        if active_voice_asset:
+            typer.echo(f"使用的音色 asset: {active_voice_asset}")
 
-    @app.command("clip-regen", help="重新生成单个 clip，可指定前一 clip 提供视觉上下文。")
+    @app.command("clip-regen", help="重新生成单个 clip，可指定前一 clip 提供视觉上下文（推荐使用 --prev-clip 抽尾段做 ref_video）。")
     def clip_regen(
         ctx: typer.Context,
         clip: int = typer.Option(..., "--clip", help="要重新生成的 clip 编号（如 4）。"),
         prompt_dir: Path = typer.Option(..., "--prompt-dir", help="包含 视频_ClipXXX.prompt.txt 的目录。"),
         image: list[Path] = typer.Option([], "--image", help="参考图，可重复传入。"),
         asset: list[str] = typer.Option([], "--asset", help="Asset 素材ID，可重复传入。"),
-        prev_clip: Path | None = typer.Option(None, "--prev-clip", help="前一 clip 的视频文件（用于抽取尾帧作为参考图）。"),
-        first_frame_url: str | None = typer.Option(None, "--first-frame-url", help="首帧图片URL（来自上一 clip 的尾帧），保证画面连续。优先于 --prev-clip。"),
+        prev_clip: Path | None = typer.Option(None, "--prev-clip", help="前一 clip 的视频文件，自动抽尾段（默认 5s）作为 reference_video。"),
+        prev_tail_seconds: float = typer.Option(5.0, "--prev-tail-seconds", help="从 --prev-clip 抽取的尾段时长（秒）。"),
+        first_frame_url: str | None = typer.Option(None, "--first-frame-url", help="首帧图片URL，保证画面连续。"),
+        last_frame_url: str | None = typer.Option(None, "--last-frame-url", help="尾帧图片URL（首尾帧驱动）。"),
+        ref_video: list[str] = typer.Option([], "--ref-video", help="额外参考视频（本地路径/URL/asset ID）。"),
+        ref_audio: list[str] = typer.Option([], "--ref-audio", help="参考音频（本地路径/URL/asset ID），用于音色锁定。"),
+        voice_asset: str | None = typer.Option(None, "--voice-asset", help="音色样本 asset ID（等价于 --ref-audio asset://<id>）。"),
+        no_audio: bool = typer.Option(False, "--no-audio", help="禁用同步音频生成。"),
+        quality: str | None = typer.Option(None, "--quality", help="视频分辨率：480p/720p/1080p。"),
         ratio: str = typer.Option("16:9", "--ratio", help="视频比例。"),
         duration: int = typer.Option(15, "--duration", help="时长（秒）。"),
         model: str | None = typer.Option(None, "--model", help="覆盖视频模型/端点 ID。"),
         prompt_header: str = typer.Option("", "--prompt-header", help="提示词前缀。"),
         output: Path | None = typer.Option(None, "--output", help="输出路径（默认覆盖原文件）。"),
     ) -> None:
-        from changdu.utils import extract_keyframes as _extract_kf
-
         clip_label = f"Clip{clip:03d}"
         prompt_file = prompt_dir / f"视频_{clip_label}.prompt.txt"
         if not prompt_file.exists():
@@ -696,21 +1313,30 @@ def register_compat_commands(app: typer.Typer) -> None:
 
         typer.echo(f"正在重新生成 {clip_label} ...")
 
-        extra_ref_images: list[Path] = []
-        if first_frame_url:
-            typer.echo(f"  使用首帧URL衔接（first_frame模式，保证画面连续）")
-        elif prev_clip and prev_clip.exists():
-            typer.echo(f"  从 {prev_clip.name} 抽取关键帧作为参考 ...")
-            kf_dir = prompt_dir / "keyframes"
-            extra_ref_images = _extract_kf(prev_clip, kf_dir)
-            typer.echo(f"  抽取到 {len(extra_ref_images)} 帧参考图")
+        videos_to_use: list[str] = list(ref_video)
+        if prev_clip and prev_clip.exists():
+            tail_dir = prompt_dir / "_tails"
+            tail_path = tail_dir / f"{prev_clip.stem}_tail.mp4"
+            try:
+                _extract_tail_segment(prev_clip, tail_path, tail_seconds=prev_tail_seconds)
+                typer.echo(f"  已抽取 {prev_clip.name} 尾段 {prev_tail_seconds:.1f}s → {tail_path.name}")
+                videos_to_use.append(str(tail_path))
+            except Exception as exc:
+                typer.echo(f"  警告：尾段抽取失败：{exc}", err=True)
 
-        all_images = list(image) + extra_ref_images if not first_frame_url else list(image)
+        audios_to_use: list[str] = list(ref_audio)
+        if voice_asset:
+            audios_to_use.append(voice_asset)
+
+        if first_frame_url:
+            typer.echo("  首帧URL衔接（first_frame）")
+        if last_frame_url:
+            typer.echo("  尾帧URL固定（last_frame）")
 
         result = _submit_video_compat(
             ctx=ctx,
             prompt=full_prompt,
-            images=all_images,
+            images=list(image),
             asset_ids=asset,
             ratio=ratio,
             duration=duration,
@@ -720,13 +1346,18 @@ def register_compat_commands(app: typer.Typer) -> None:
             run_name=f"clip-regen-{clip_label}",
             return_last_frame=True,
             first_frame_url=first_frame_url,
+            last_frame_url=last_frame_url,
+            ref_videos=videos_to_use,
+            ref_audios=audios_to_use,
+            generate_audio=not no_audio,
+            quality=quality,
         )
 
         if result and result.last_frame_url:
             typer.echo(f"  新尾帧URL: {result.last_frame_url}")
         typer.echo(f"{clip_label} 重新生成完毕: {clip_output}")
 
-    @app.command("clip-chain-regen", help="连续重新生成多个 clip，自动用尾帧衔接保证画面连续（穿帮修复利器）。")
+    @app.command("clip-chain-regen", help="连续重新生成多个 clip，默认用前一 clip 尾段作为 reference_video 衔接（穿帮修复利器）。")
     def clip_chain_regen(
         ctx: typer.Context,
         clips: str = typer.Option(..., "--clips", help="要重新生成的 clip 编号列表，逗号分隔（如 2,3,4）。"),
@@ -735,6 +1366,20 @@ def register_compat_commands(app: typer.Typer) -> None:
         asset: list[str] = typer.Option([], "--asset", help="Asset 素材ID（每个 clip 共享），可重复传入。"),
         start_frame_url: str | None = typer.Option(None, "--start-frame-url", help="链条起始首帧URL（来自前一 clip 的 last_frame_url）。"),
         regen_prev: bool = typer.Option(False, "--regen-prev", help="先重新生成 clips 列表前一个 clip 以获取 last_frame_url 作为起点。"),
+        continuity_mode: str = typer.Option(
+            "ref_video",
+            "--continuity-mode",
+            help=(
+                "衔接模式：first_frame / ref_video（默认，更强一致性）/ "
+                "auto（先 ref_video，被 ARK 拒绝时自动降级到 first_frame）。"
+                "（旧值 both 等价于 auto，已保留兼容。）"
+            ),
+        ),
+        prev_tail_seconds: float = typer.Option(5.0, "--prev-tail-seconds", help="ref_video 模式下从前一 clip 抽取的尾段时长（秒）。"),
+        voice_asset: str | None = typer.Option(None, "--voice-asset", help="音色样本 asset ID，每个 clip 都会附加。"),
+        ref_audio: list[str] = typer.Option([], "--ref-audio", help="额外参考音频，每个 clip 共享。"),
+        no_audio: bool = typer.Option(False, "--no-audio", help="禁用同步音频生成。"),
+        quality: str | None = typer.Option(None, "--quality", help="视频分辨率：480p/720p/1080p。"),
         ratio: str = typer.Option("16:9", "--ratio", help="视频比例。"),
         duration: int = typer.Option(15, "--duration", help="每个 clip 的时长（秒）。"),
         model: str | None = typer.Option(None, "--model", help="覆盖视频模型/端点 ID。"),
@@ -748,6 +1393,12 @@ def register_compat_commands(app: typer.Typer) -> None:
             typer.echo("错误：--clips 参数为空。", err=True)
             raise typer.Exit(1)
 
+        if continuity_mode not in {"first_frame", "ref_video", "both", "auto"}:
+            typer.echo("错误：--continuity-mode 必须是 first_frame / ref_video / auto 之一。", err=True)
+            raise typer.Exit(1)
+        if continuity_mode == "both":
+            continuity_mode = "auto"
+
         out_dir = output_dir or prompt_dir
 
         for cn in clip_nums:
@@ -756,15 +1407,20 @@ def register_compat_commands(app: typer.Typer) -> None:
                 typer.echo(f"错误：未找到 {pf}", err=True)
                 raise typer.Exit(1)
 
-        last_frame_url: str | None = start_frame_url
+        shared_audios: list[str] = list(ref_audio)
+        if voice_asset:
+            shared_audios.append(voice_asset)
 
+        last_frame_url: str | None = start_frame_url
+        last_video_path: Path | None = None
+
+        prev_num = clip_nums[0] - 1
         if regen_prev and not last_frame_url:
-            prev_num = clip_nums[0] - 1
             if prev_num >= 1:
                 prev_label = f"Clip{prev_num:03d}"
                 prev_prompt_file = prompt_dir / f"视频_{prev_label}.prompt.txt"
                 if prev_prompt_file.exists():
-                    typer.echo(f"先重新生成 {prev_label} 以获取尾帧URL ...")
+                    typer.echo(f"先重新生成 {prev_label} 以获取衔接素材 ...")
                     prev_prompt = prev_prompt_file.read_text(encoding="utf-8").strip()
                     prev_full = f"{prompt_header}{prev_prompt}" if prompt_header else prev_prompt
                     prev_output = out_dir / f"视频_{prev_label}.mp4"
@@ -773,15 +1429,20 @@ def register_compat_commands(app: typer.Typer) -> None:
                         asset_ids=asset, ratio=ratio, duration=duration,
                         model=model, wait=True, output=prev_output,
                         run_name=f"chain-prev-{prev_label}", return_last_frame=True,
+                        ref_audios=shared_audios, generate_audio=not no_audio, quality=quality,
                     )
                     if prev_result and prev_result.last_frame_url:
                         last_frame_url = prev_result.last_frame_url
                         typer.echo(f"  {prev_label} 尾帧URL已获取")
-                    else:
-                        typer.echo(f"  警告：{prev_label} 未返回尾帧URL")
+                    if prev_output.exists():
+                        last_video_path = prev_output
+        elif prev_num >= 1:
+            existing_prev = out_dir / f"视频_Clip{prev_num:03d}.mp4"
+            if existing_prev.exists():
+                last_video_path = existing_prev
 
         typer.echo(f"将按顺序重新生成 {len(clip_nums)} 个 clip: {', '.join(f'Clip{c:03d}' for c in clip_nums)}")
-        typer.echo(f"模式: {'尾帧衔接' if last_frame_url else '独立生成（无首帧约束）'}")
+        typer.echo(f"模式: continuity={continuity_mode}, voice_asset={'有' if voice_asset else '无'}")
 
         for idx, cn in enumerate(clip_nums):
             clip_label = f"Clip{cn:03d}"
@@ -792,30 +1453,86 @@ def register_compat_commands(app: typer.Typer) -> None:
 
             typer.echo(f"\n{'='*50}")
             typer.echo(f"[{idx+1}/{len(clip_nums)}] 正在重新生成 {clip_label} ...")
-            if last_frame_url:
-                typer.echo(f"  首帧URL衔接模式（保证画面连续）")
 
-            result = _submit_video_compat(
-                ctx=ctx,
-                prompt=full_prompt,
-                images=list(image) if not last_frame_url else [],
-                asset_ids=asset,
-                ratio=ratio,
-                duration=duration,
-                model=model,
-                wait=True,
-                output=clip_output,
-                run_name=f"chain-regen-{clip_label}",
-                return_last_frame=True,
-                first_frame_url=last_frame_url,
-            )
+            ff_url: str | None = None
+            videos_for_this: list[str] = []
+
+            if continuity_mode == "first_frame" and last_frame_url:
+                ff_url = last_frame_url
+                typer.echo("  首帧URL衔接")
+
+            if continuity_mode in {"ref_video", "auto"} and last_video_path and last_video_path.exists():
+                tail_dir = out_dir / "_tails"
+                tail_path = tail_dir / f"{last_video_path.stem}_tail.mp4"
+                try:
+                    _extract_tail_segment(last_video_path, tail_path, tail_seconds=prev_tail_seconds)
+                    videos_for_this.append(str(tail_path))
+                    typer.echo(f"  ref_video 衔接：{last_video_path.name} → 尾段 {prev_tail_seconds:.1f}s")
+                except Exception as exc:
+                    typer.echo(f"  警告：尾段抽取失败：{exc}", err=True)
+
+            try:
+                result = _submit_video_compat(
+                    ctx=ctx,
+                    prompt=full_prompt,
+                    images=list(image),
+                    asset_ids=asset,
+                    ratio=ratio,
+                    duration=duration,
+                    model=model,
+                    wait=True,
+                    output=clip_output,
+                    run_name=f"chain-regen-{clip_label}",
+                    return_last_frame=True,
+                    first_frame_url=ff_url,
+                    ref_videos=videos_for_this,
+                    ref_audios=shared_audios,
+                    generate_audio=not no_audio,
+                    quality=quality,
+                )
+            except Exception as exc:
+                msg = str(exc)
+                can_fallback = (
+                    continuity_mode == "auto"
+                    and last_frame_url
+                    and videos_for_this
+                    and (
+                        "may contain real person" in msg
+                        or "first/last frame content cannot be mixed" in msg
+                        or "Sensitive" in msg
+                    )
+                )
+                if not can_fallback:
+                    raise
+                typer.echo(
+                    f"  警告：ref_video 提交被拒（{msg.splitlines()[0][:120]}），降级为 first_frame_url 重试 ..."
+                )
+                result = _submit_video_compat(
+                    ctx=ctx,
+                    prompt=full_prompt,
+                    images=[],
+                    asset_ids=[],
+                    ratio=ratio,
+                    duration=duration,
+                    model=model,
+                    wait=True,
+                    output=clip_output,
+                    run_name=f"chain-regen-{clip_label}-fallback",
+                    return_last_frame=True,
+                    first_frame_url=last_frame_url,
+                    ref_videos=[],
+                    ref_audios=[],
+                    generate_audio=not no_audio,
+                    quality=quality,
+                )
 
             if result and result.last_frame_url:
                 last_frame_url = result.last_frame_url
-                typer.echo(f"  尾帧URL已缓存，将用于下一 clip 衔接")
+                typer.echo("  尾帧URL已缓存，将用于下一 clip 衔接")
             else:
                 last_frame_url = None
-                typer.echo(f"  警告：未获取到尾帧URL，下一 clip 将无首帧约束")
+            if clip_output.exists():
+                last_video_path = clip_output
 
         typer.echo(f"\n{'='*50}")
         typer.echo(f"全部 {len(clip_nums)} 个 clip 重新生成完毕！")
@@ -841,12 +1558,37 @@ def register_compat_commands(app: typer.Typer) -> None:
                 filelist.unlink(missing_ok=True)
                 typer.echo(f"已拼接: {c_output} ({len(all_clips)} 个 clip)")
 
-    @app.command("clip-concat", help="将目录下所有 clip 按顺序拼接为完整视频，保留音视频轨道。")
+    @app.command(
+        "clip-concat",
+        help=(
+            "拼接 clip 为完整视频。默认 stream copy；启用任一高级选项时切换到 "
+            "filter_complex 重编码（xfade + acrossfade + loudnorm + BGM 叠加 + sidechain ducking）。"
+        ),
+    )
     def clip_concat(
         ctx: typer.Context,
         input_dir: Path = typer.Option(..., "--input-dir", "-d", help="包含 视频_ClipXXX.mp4 的目录。"),
         output: Path = typer.Option(..., "--output", "-o", help="输出视频路径。"),
         trim_tail: float = typer.Option(0.0, "--trim-tail", help="裁掉每个 clip 尾部的秒数（可解决叙事泄漏）。"),
+        crossfade_seconds: float = typer.Option(
+            0.0,
+            "--crossfade-seconds",
+            help="段间淡变时长（秒，建议 0.3-0.6）。>0 时强制重编码。",
+        ),
+        normalize_audio: bool = typer.Option(
+            False,
+            "--normalize-audio/--no-normalize-audio",
+            help="启用 loudnorm (I=-16 LRA=11 TP=-1.5)，统一段间音量。",
+        ),
+        bgm: Path | None = typer.Option(None, "--bgm", help="BGM 音频文件路径（mp3/wav/m4a），叠加为背景音乐。"),
+        bgm_volume: float = typer.Option(0.25, "--bgm-volume", help="BGM 音量增益（0-1）。"),
+        bgm_ducking: bool = typer.Option(
+            True,
+            "--bgm-ducking/--no-bgm-ducking",
+            help="人声/动作声出现时自动压低 BGM（sidechaincompress）。",
+        ),
+        bgm_fadein: float = typer.Option(1.5, "--bgm-fadein", help="BGM 淡入秒数。"),
+        bgm_fadeout: float = typer.Option(2.0, "--bgm-fadeout", help="BGM 淡出秒数。"),
     ) -> None:
         import re
         import subprocess
@@ -860,6 +1602,12 @@ def register_compat_commands(app: typer.Typer) -> None:
             typer.echo(f"错误：在 {input_dir} 中未找到 视频_ClipXXX.mp4 文件。", err=True)
             raise typer.Exit(1)
 
+        if bgm is not None:
+            bgm = bgm.resolve()
+            if not bgm.exists():
+                typer.echo(f"错误：BGM 文件不存在 {bgm}", err=True)
+                raise typer.Exit(1)
+
         output = output.resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
         tmp_dir = output.parent / "_concat_tmp"
@@ -869,11 +1617,7 @@ def register_compat_commands(app: typer.Typer) -> None:
             sources: list[Path] = []
             for clip in clips:
                 if trim_tail > 0:
-                    probe = subprocess.run(
-                        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(clip)],
-                        capture_output=True, text=True, timeout=10,
-                    )
-                    dur = float(probe.stdout.strip()) if probe.stdout.strip() else 15.0
+                    dur = _probe_duration(clip, default=15.0)
                     end = max(dur - trim_tail, 1.0)
                     trimmed = tmp_dir / clip.name
                     subprocess.run(
@@ -885,25 +1629,119 @@ def register_compat_commands(app: typer.Typer) -> None:
                 else:
                     sources.append(clip.resolve())
 
-            filelist = tmp_dir / "concat_list.txt"
-            filelist.write_text("\n".join(f"file '{s}'" for s in sources) + "\n")
-            result = subprocess.run(
-                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(filelist), "-c", "copy", str(output)],
-                capture_output=True, text=True, timeout=300,
+            advanced = (
+                crossfade_seconds > 0
+                or normalize_audio
+                or bgm is not None
             )
-            if result.returncode != 0:
-                typer.echo(f"拼接失败: {result.stderr[-200:]}", err=True)
+
+            if not advanced:
+                filelist = tmp_dir / "concat_list.txt"
+                filelist.write_text("\n".join(f"file '{s}'" for s in sources) + "\n")
+                result = subprocess.run(
+                    ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(filelist), "-c", "copy", str(output)],
+                    capture_output=True, text=True, timeout=300,
+                )
+                if result.returncode != 0:
+                    typer.echo(f"拼接失败: {result.stderr[-200:]}", err=True)
+                    raise typer.Exit(1)
+                final_dur = _probe_duration(output)
+                typer.echo(f"拼接完成（stream copy）: {output} ({len(clips)} 个 clip, {final_dur:.1f}s)")
+                return
+
+            try:
+                final_dur, _ = _run_concat_with_filters(
+                    sources,
+                    output,
+                    crossfade=crossfade_seconds,
+                    normalize_audio=normalize_audio,
+                    bgm=bgm,
+                    bgm_volume=bgm_volume,
+                    bgm_ducking=bgm_ducking,
+                    bgm_fadein=bgm_fadein,
+                    bgm_fadeout=bgm_fadeout,
+                )
+            except RuntimeError as exc:
+                typer.echo(f"拼接失败: {exc}", err=True)
                 raise typer.Exit(1)
 
-            probe = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(output)],
-                capture_output=True, text=True, timeout=10,
+            features = []
+            if crossfade_seconds > 0:
+                features.append(f"xfade {crossfade_seconds:.2f}s")
+            if normalize_audio:
+                features.append("loudnorm")
+            if bgm is not None:
+                features.append("bgm" + (" + ducking" if bgm_ducking else ""))
+            typer.echo(
+                f"拼接完成（重编码 · {' / '.join(features)}）: {output} "
+                f"({len(clips)} 个 clip, {final_dur:.1f}s)"
             )
-            dur_str = probe.stdout.strip()
-            typer.echo(f"拼接完成: {output} ({len(clips)} 个 clip, {float(dur_str):.1f}s)")
         finally:
             import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    @app.command(
+        "clip-add-bgm",
+        help=(
+            "在已有视频上叠加 BGM（fade + 可选 sidechain ducking + 可选 loudnorm），"
+            "适合 clip-concat 完成后单独换 BGM、不重跑视频。"
+        ),
+    )
+    def clip_add_bgm(
+        ctx: typer.Context,
+        input_file: Path = typer.Option(..., "--input", "-i", help="输入视频文件（mp4）。"),
+        bgm: Path = typer.Option(..., "--bgm", help="BGM 音频文件路径（mp3/wav/m4a）。"),
+        output: Path = typer.Option(..., "--output", "-o", help="输出视频路径。"),
+        bgm_volume: float = typer.Option(0.25, "--bgm-volume", help="BGM 音量（0-1）。"),
+        bgm_ducking: bool = typer.Option(
+            True,
+            "--bgm-ducking/--no-bgm-ducking",
+            help="人声/动作声出现时自动压低 BGM。",
+        ),
+        bgm_fadein: float = typer.Option(1.5, "--bgm-fadein", help="BGM 淡入秒数。"),
+        bgm_fadeout: float = typer.Option(2.0, "--bgm-fadeout", help="BGM 淡出秒数。"),
+        normalize_audio: bool = typer.Option(
+            False,
+            "--normalize-audio/--no-normalize-audio",
+            help="对原视频音轨先做 loudnorm（推荐多段拼接后开）。",
+        ),
+    ) -> None:
+        input_file = input_file.resolve()
+        bgm = bgm.resolve()
+        if not input_file.exists():
+            typer.echo(f"错误：视频文件不存在 {input_file}", err=True)
+            raise typer.Exit(1)
+        if not bgm.exists():
+            typer.echo(f"错误：BGM 文件不存在 {bgm}", err=True)
+            raise typer.Exit(1)
+
+        output = output.resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            final_dur, _ = _run_concat_with_filters(
+                [input_file],
+                output,
+                crossfade=0.0,
+                normalize_audio=normalize_audio,
+                bgm=bgm,
+                bgm_volume=bgm_volume,
+                bgm_ducking=bgm_ducking,
+                bgm_fadein=bgm_fadein,
+                bgm_fadeout=bgm_fadeout,
+            )
+        except RuntimeError as exc:
+            typer.echo(f"叠加 BGM 失败: {exc}", err=True)
+            raise typer.Exit(1)
+
+        features = ["bgm"]
+        if bgm_ducking:
+            features.append("ducking")
+        if normalize_audio:
+            features.append("loudnorm")
+        typer.echo(
+            f"BGM 叠加完成（{' / '.join(features)}）: {output} ({final_dur:.1f}s)"
+        )
 
     @app.command("clip-trim", help="裁剪单个 clip 的头部或尾部（保留音视频），用于去除叙事泄漏。")
     def clip_trim(
@@ -945,6 +1783,215 @@ def register_compat_commands(app: typer.Typer) -> None:
             capture_output=True, text=True, timeout=10,
         )
         typer.echo(f"裁剪完成: {output} ({float(probe2.stdout.strip()):.1f}s)")
+
+    @app.command("clip-extract-tail", help="从 mp4 抽取尾段（默认 5s），可选自动上传 TOS 用于做 reference_video。")
+    def clip_extract_tail(
+        ctx: typer.Context,
+        input_file: Path = typer.Option(..., "--input", "-i", help="输入视频文件（mp4）。"),
+        output: Path | None = typer.Option(None, "--output", "-o", help="输出尾段文件（默认 <input>_tail.mp4）。"),
+        tail_seconds: float = typer.Option(5.0, "--tail-seconds", help="尾段时长（秒，2-15）。"),
+        upload_tos: bool = typer.Option(False, "--upload/--no-upload", help="是否上传到 TOS 并返回 URL。"),
+    ) -> None:
+        obj: AppContext = ctx.obj
+        input_file = input_file.resolve()
+        if not input_file.exists():
+            typer.echo(f"错误：文件不存在 {input_file}", err=True)
+            raise typer.Exit(1)
+        if output is None:
+            output = input_file.with_name(f"{input_file.stem}_tail.mp4")
+        output = output.resolve()
+
+        try:
+            _extract_tail_segment(input_file, output, tail_seconds=tail_seconds)
+        except Exception as exc:
+            typer.echo(f"抽取失败：{exc}", err=True)
+            raise typer.Exit(1)
+
+        url: str | None = None
+        if upload_tos:
+            url = _upload_to_tos(output, kind="video")
+
+        payload = {"input": str(input_file), "output": str(output), "tail_seconds": tail_seconds, "url": url}
+        pretty = [f"输入: {input_file.name}", f"尾段输出: {output}", f"时长: {tail_seconds:.1f}s"]
+        if url:
+            pretty.append(f"TOS URL: {url}")
+        _emit(obj, payload, pretty)
+
+    @app.command("voice-extract", help="从视频提取一段对白音频（默认 6-12s 区间），可选自动上传 TOS。")
+    def voice_extract(
+        ctx: typer.Context,
+        input_file: Path = typer.Option(..., "--input", "-i", help="输入视频文件（mp4）。"),
+        output: Path | None = typer.Option(None, "--output", "-o", help="输出音频文件（默认 <input>_voice.mp3）。"),
+        start: float = typer.Option(6.0, "--start", help="起始时间（秒）。"),
+        duration: float = typer.Option(8.0, "--duration", help="时长（秒，2-15）。"),
+        fmt: str = typer.Option("mp3", "--fmt", help="输出格式：mp3 / wav。"),
+        upload_tos: bool = typer.Option(False, "--upload/--no-upload", help="是否上传到 TOS 并返回 URL。"),
+    ) -> None:
+        obj: AppContext = ctx.obj
+        input_file = input_file.resolve()
+        if not input_file.exists():
+            typer.echo(f"错误：文件不存在 {input_file}", err=True)
+            raise typer.Exit(1)
+        if output is None:
+            ext = "wav" if fmt.lower() == "wav" else "mp3"
+            output = input_file.with_name(f"{input_file.stem}_voice.{ext}")
+        output = output.resolve()
+
+        try:
+            _extract_voice_audio(input_file, output, start=start, duration=duration, fmt=fmt)
+        except Exception as exc:
+            typer.echo(f"提取失败：{exc}", err=True)
+            raise typer.Exit(1)
+
+        url: str | None = None
+        if upload_tos:
+            url = _upload_to_tos(output, kind="audio")
+
+        payload = {
+            "input": str(input_file),
+            "output": str(output),
+            "start": start,
+            "duration": duration,
+            "url": url,
+        }
+        pretty = [
+            f"输入: {input_file.name}",
+            f"音频输出: {output}",
+            f"区间: {start:.1f}s - {start+duration:.1f}s",
+        ]
+        if url:
+            pretty.append(f"TOS URL: {url}")
+        _emit(obj, payload, pretty)
+
+    @app.command(
+        "voice-asset-from-clip",
+        help=(
+            "从视频提取音色 → 上传 TOS → 尝试 asset 入库（失败自动切换格式或回退到直接 TOS URL）。"
+            "无论 asset 是否成功，TOS URL 都可直接做 --reference-audio。"
+        ),
+    )
+    def voice_asset_from_clip(
+        ctx: typer.Context,
+        input_file: Path = typer.Option(..., "--input", "-i", help="输入视频文件（mp4，通常是第 1 个 clip）。"),
+        group_id: str = typer.Option(..., "--group-id", help="所属素材组 ID。"),
+        name: str = typer.Option("", "--name", help="素材名称（默认 voice-from-<filename>）。"),
+        start: float = typer.Option(6.0, "--start", help="起始时间（秒）。"),
+        duration: float = typer.Option(8.0, "--duration", help="时长（秒，2-15）。"),
+        fmt: str = typer.Option("wav", "--fmt", help="首选音频格式：wav / mp3。失败会自动尝试另一格式。"),
+        keep_local: bool = typer.Option(False, "--keep-local/--cleanup", help="是否保留本地音频文件。"),
+        wait: bool = typer.Option(True, "--wait/--no-wait", help="等待 asset Active。"),
+    ) -> None:
+        obj: AppContext = ctx.obj
+        input_file = input_file.resolve()
+        if not input_file.exists():
+            typer.echo(f"错误：文件不存在 {input_file}", err=True)
+            raise typer.Exit(1)
+
+        primary = "wav" if fmt.lower() == "wav" else "mp3"
+        secondary = "mp3" if primary == "wav" else "wav"
+        try_order = [primary, secondary]
+
+        asset_name = name or f"voice-from-{input_file.stem}"
+        asset_id: str | None = None
+        asset_url: str | None = None
+        asset_status: str | None = None
+        used_fmt: str | None = None
+        last_voice_url: str | None = None
+        last_voice_path: Path | None = None
+        last_asset_error: Exception | None = None
+
+        for attempt_fmt in try_order:
+            voice_path = input_file.with_name(f"{input_file.stem}_voice.{attempt_fmt}")
+            try:
+                _extract_voice_audio(
+                    input_file, voice_path, start=start, duration=duration, fmt=attempt_fmt
+                )
+            except Exception as exc:
+                typer.echo(f"  提取失败（fmt={attempt_fmt}）：{exc}", err=True)
+                continue
+            typer.echo(f"音色样本已抽取（{attempt_fmt}）：{voice_path.name}（{duration:.1f}s）")
+
+            try:
+                voice_url = _upload_to_tos(voice_path, kind="audio")
+            except Exception as exc:
+                typer.echo(f"  TOS 上传失败（fmt={attempt_fmt}）：{exc}", err=True)
+                continue
+            last_voice_url = voice_url
+            last_voice_path = voice_path
+
+            try:
+                client = _build_assets_client()
+                asset = client.create_asset(
+                    group_id=group_id, url=voice_url, asset_type="Audio", name=asset_name
+                )
+                typer.echo(f"已入库素材ID: {asset.id}（处理中）")
+                if wait:
+                    asset = client.wait_for_active(asset.id)
+                    typer.echo(f"素材状态: 可用，引用URL: {asset.asset_url}")
+                asset_id = asset.id
+                asset_url = asset.asset_url
+                asset_status = asset.status
+                used_fmt = attempt_fmt
+                last_asset_error = None
+                break
+            except Exception as exc:
+                last_asset_error = exc
+                typer.echo(
+                    f"  警告：asset 入库失败（fmt={attempt_fmt}）：{exc}",
+                    err=True,
+                )
+                continue
+
+        if asset_id is None and last_voice_url is None:
+            typer.echo("错误：所有格式均提取/上传失败，无法生成音色样本。", err=True)
+            raise typer.Exit(1)
+
+        if asset_id is None:
+            used_fmt = used_fmt or try_order[-1]
+            typer.echo(
+                "  asset 入库均失败（"
+                f"{type(last_asset_error).__name__ if last_asset_error else 'unknown'}），"
+                f"回退使用 TOS URL 直接做 --reference-audio: {last_voice_url}"
+            )
+
+        if not keep_local and last_voice_path is not None:
+            try:
+                last_voice_path.unlink()
+            except Exception:
+                pass
+
+        payload = {
+            "voice_asset_id": asset_id,
+            "asset_url": asset_url,
+            "tos_url": last_voice_url,
+            "status": asset_status,
+            "used_fmt": used_fmt,
+            "fallback_used": asset_id is None,
+        }
+        pretty: list[str] = []
+        if asset_id is not None:
+            pretty.extend([
+                f"音色 Asset ID: {asset_id}",
+                f"asset:// 引用: {asset_url}",
+                f"原始 TOS URL: {last_voice_url}",
+                f"使用格式: {used_fmt}",
+                f"状态: {asset_status}",
+                "",
+                "复用方式（推荐）：",
+                f"  changdu sequential-generate ... --voice-asset {asset_id}",
+                f"  changdu multimodal2video ... --ref-audio {asset_id}",
+            ])
+        else:
+            pretty.extend([
+                "音色 Asset 入库失败，已自动回退到 TOS URL 模式：",
+                f"  TOS URL: {last_voice_url}",
+                f"  使用格式: {used_fmt}",
+                "",
+                "复用方式（fallback）：",
+                f"  changdu sequential-generate ... --reference-audio {last_voice_url}",
+                f"  changdu multimodal2video ... --ref-audio {last_voice_url}",
+            ])
+        _emit(obj, payload, pretty)
 
     @app.command("prompt-optimize", help="基于 Seedance 2.0 提示词指南优化视频提示词，提升生成质量、减少穿帮。")
     def prompt_optimize(
@@ -1061,7 +2108,30 @@ def register_compat_commands(app: typer.Typer) -> None:
             if found_ambiguous_hair and not has_explicit_hat:
                 issues.append(f"[头饰] 发型描述模糊: {', '.join(found_ambiguous_hair)} — 易导致帽子时有时无穿帮，应明确写'头戴XX帽'或'无帽露发髻'")
 
-            # --- Rule 10: Cross-clip consistency (batch mode) ---
+            # --- Rule 10: Makeup lock (Seedance 2.0 multimodal) ---
+            has_makeup_lock = "【妆造锁定】" in raw
+            makeup_keywords = ["眼影", "口红", "腮红", "眉形", "美瞳", "假睫毛", "鬓角", "刘海", "盘发"]
+            mentions_makeup = any(k in raw for k in makeup_keywords)
+            if mentions_makeup and not has_makeup_lock:
+                issues.append("[妆造] 文中提到妆容/发型却无【妆造锁定】块 — 强烈建议拆出独立块，避免被淹没")
+            elif not has_makeup_lock and has_char_anchor:
+                issues.append("[妆造] 缺少【妆造锁定】块 — 建议显式锁定五官细节、妆容、发型，使用 ref_video + ref_image 双锚定时尤其重要")
+
+            # --- Rule 11: Voice anchor (Seedance 2.0 multimodal audio) ---
+            has_voice_anchor = "【音色锚定】" in raw
+            mentions_voice = any(k in raw for k in ["开口", "对白", "台词", "说道", "低声", "喊道", "嗓音", "音色", "声音"])
+            if mentions_voice and not has_voice_anchor:
+                issues.append("[音色] 文中含台词/对白却无【音色锚定】块 — 应显式标注 'reference_audio: voice_asset_xxx'，否则音色会随机变化")
+
+            # --- Rule 12: Video reference explanation (Seedance 2.0 multimodal video) ---
+            has_video_ref_block = "【视频参考】" in raw or "【视频参考说明】" in raw
+            mentions_video_ref = any(k in raw for k in ["参考视频", "上一段尾", "前段画面", "ref_video", "reference_video"])
+            if mentions_video_ref and not has_video_ref_block:
+                issues.append(
+                    "[视频参考] 提到了参考视频却无【视频参考说明】块 — 应自然语言说明每段 reference_video 的用途，例如\"视频1 是上一段尾部，保持人物外观与位置连续\""
+                )
+
+            # --- Rule 13: Cross-clip consistency (batch mode) ---
             if input_dir and len(files) > 1:
                 char_anchor = re.search(r"【角色锚定】(.+?)(?:\n|【)", raw, re.DOTALL)
                 neg_constraint = re.search(r"【否定约束】(.+?)(?:\n|$)", raw, re.DOTALL)
@@ -1190,50 +2260,84 @@ def register_compat_commands(app: typer.Typer) -> None:
         typer.echo('# 4) 用素材生成真人视频')
         typer.echo('changdu multimodal2video --asset <素材ID> --asset <素材ID2> --prompt "图片1的女孩..." --wait --output clip.mp4')
         typer.echo("")
-        typer.echo("【示例7：连续视频生成（尾帧衔接）】")
-        typer.echo("# 一键顺序生成多个 clip，自动用前一 clip 的尾帧作为下一 clip 的首帧")
+        typer.echo("【示例7：连续视频生成（推荐：ref_video 衔接 + 音色锁定）】")
+        typer.echo("# 一键顺序生成多个 clip，默认用前一 clip 尾段做 reference_video，锁定妆造/站位/音色")
         typer.echo("changdu sequential-generate \\")
         typer.echo("  --prompt-dir ./单集制作/EP001/ \\")
-        typer.echo("  --asset <角色ID> --asset <场景ID> \\")
+        typer.echo("  --asset <角色三视图ID> --asset <场景ID> \\")
+        typer.echo("  --continuity-mode ref_video \\")
+        typer.echo("  --voice-asset <音色样本ID> \\")
+        typer.echo("  --prev-tail-seconds 5 \\")
         typer.echo("  --ratio 16:9 --duration 15 \\")
-        typer.echo('  --prompt-header "图片1是主角，图片2是场景。" \\')
+        typer.echo('  --prompt-header "图片1是女主三视图，图片2是场景。视频1 是前段尾段，仅作妆造参考。音轨1 锁音色。" \\')
         typer.echo("  --output-dir ./单集制作/EP001/")
         typer.echo("")
-        typer.echo("【示例8：手动尾帧衔接（单个命令）】")
-        typer.echo("# 第1个 clip：生成视频并返回尾帧URL")
-        typer.echo('changdu multimodal2video --image 角色.jpg --prompt "..." --wait --output clip001.mp4 --return-last-frame')
-        typer.echo("# 第2个 clip：将上一 clip 的尾帧URL作为首帧")
-        typer.echo('changdu multimodal2video --image 角色.jpg --prompt "..." --wait --output clip002.mp4 --return-last-frame --first-frame-url <上一clip的尾帧URL>')
-        typer.echo("")
-        typer.echo("【示例9：穿帮修复 — 重新生成单个 clip】")
-        typer.echo("# 修改 prompt 后用 Seedance 重新生成第4个 clip（穿帮的正确修复方式）")
-        typer.echo("changdu clip-regen \\")
-        typer.echo("  --clip 4 --prompt-dir ./单集制作/EP001/ \\")
-        typer.echo("  --asset <角色ID> --asset <场景ID> \\")
-        typer.echo("  --prompt-header '图片1是男主面部，图片2是场景。' \\")
+        typer.echo("【示例7b：让 sequential-generate 自动在第1段后入库音色，从第2段起复用】")
+        typer.echo("changdu sequential-generate \\")
+        typer.echo("  --prompt-dir ./单集制作/EP001/ \\")
+        typer.echo("  --asset <女主三视图ID> --asset <场景ID> \\")
+        typer.echo("  --continuity-mode ref_video \\")
+        typer.echo("  --voice-from-clip 1 --voice-group-id <主角素材组ID> \\")
+        typer.echo("  --voice-clip-start 6 --voice-clip-duration 8 \\")
         typer.echo("  --ratio 16:9 --duration 15")
         typer.echo("")
-        typer.echo("【示例10：拼接全部 clip 为完整视频（保留音频）】")
+        typer.echo("【示例8：手动多模态参考生视频（图 + 视频 + 音频 三类一起喂）】")
+        typer.echo('changdu multimodal2video \\')
+        typer.echo('  --image 角色三视图.jpg --image 场景.jpg \\')
+        typer.echo('  --ref-video ./单集制作/EP001/视频_Clip003.mp4 \\')
+        typer.echo('  --voice-asset asset-xxxxxxxx \\')
+        typer.echo('  --prompt "图1是女主三视图，图2是场景。视频1 是 Clip003 尾段，仅做妆造与位置参考。音轨1 锁音色。" \\')
+        typer.echo('  --ratio 16:9 --duration 15 --wait --output clip004.mp4')
+        typer.echo("")
+        typer.echo("【示例8b：旧式手动尾帧衔接（仅向下兼容，更建议用 ref_video）】")
+        typer.echo('changdu multimodal2video --image 角色.jpg --prompt "..." --wait --output clip001.mp4 --return-last-frame')
+        typer.echo('changdu multimodal2video --image 角色.jpg --prompt "..." --wait --output clip002.mp4 --return-last-frame --first-frame-url <上一clip的尾帧URL>')
+        typer.echo("")
+        typer.echo("【示例9：穿帮修复 — 妆造/角色 用 ref_video + ref_image 双锚定重生】")
+        typer.echo("changdu clip-regen \\")
+        typer.echo("  --clip 4 --prompt-dir ./单集制作/EP001/ \\")
+        typer.echo("  --asset <女主三视图ID> --asset <场景ID> \\")
+        typer.echo("  --prev-clip ./单集制作/EP001/视频_Clip003.mp4 \\")
+        typer.echo("  --voice-asset <音色样本ID> \\")
+        typer.echo("  --prompt-header '图片1是女主三视图，图片2是场景。视频1 是 Clip003 尾段，仅做妆造与位置参考。音轨1 锁音色。' \\")
+        typer.echo("  --ratio 16:9 --duration 15")
+        typer.echo("")
+        typer.echo("【示例9b：链式重生（连续多段 CHARACTER/MAKEUP 穿帮）】")
+        typer.echo("changdu clip-chain-regen \\")
+        typer.echo("  --clips 7,8,9 --prompt-dir ./单集制作/EP001/ \\")
+        typer.echo("  --asset <女主三视图ID> --asset <场景ID> \\")
+        typer.echo("  --regen-prev --continuity-mode ref_video \\")
+        typer.echo("  --voice-asset <音色样本ID> \\")
+        typer.echo("  --ratio 16:9 --duration 15")
+        typer.echo("")
+        typer.echo("【示例10：抽前段尾段做下一段的 reference_video】")
+        typer.echo("changdu clip-extract-tail -i 视频_Clip003.mp4 --tail-seconds 5 --upload")
+        typer.echo("")
+        typer.echo("【示例11：从视频提取主角音色，并入库为 Audio Asset】")
+        typer.echo("changdu voice-asset-from-clip \\")
+        typer.echo("  --input ./单集制作/EP001/视频_Clip001.mp4 \\")
+        typer.echo("  --group-id <主角素材组ID> --start 6 --duration 8")
+        typer.echo("# 输出：音色 Asset ID: asset-xxxxxxxx，可直接在后续命令中用 --voice-asset 引用")
+        typer.echo("")
+        typer.echo("【示例12：拼接全部 clip 为完整视频（保留音频）】")
         typer.echo("changdu clip-concat \\")
         typer.echo("  --input-dir ./单集制作/EP001/ \\")
         typer.echo("  --output ./单集制作/EP001/完整版.mp4")
         typer.echo("")
-        typer.echo("【示例11：拼接 + 裁掉每个 clip 尾部（去叙事泄漏）】")
+        typer.echo("【示例13：拼接 + 裁掉每个 clip 尾部（去叙事泄漏）】")
         typer.echo("changdu clip-concat \\")
         typer.echo("  --input-dir ./单集制作/EP001/ \\")
         typer.echo("  --output ./单集制作/EP001/完整版.mp4 \\")
         typer.echo("  --trim-tail 1.0")
         typer.echo("")
-        typer.echo("【示例12：裁剪单个 clip（去头尾叙事泄漏）】")
+        typer.echo("【示例14：裁剪单个 clip（去头尾叙事泄漏）】")
         typer.echo("changdu clip-trim \\")
         typer.echo("  --input 视频_Clip003.mp4 \\")
         typer.echo("  --output 视频_Clip003_trimmed.mp4 \\")
         typer.echo("  --trim-tail 2.0")
         typer.echo("")
-        typer.echo("【示例13：提示词优化（批量检查）】")
+        typer.echo("【示例15：提示词优化（含妆造/音色/视频参考三条新规则）】")
         typer.echo("changdu prompt-optimize --dir ./单集制作/EP003/ --check")
-        typer.echo("")
-        typer.echo("【示例14：提示词优化（自动修复）】")
         typer.echo("changdu prompt-optimize --dir ./单集制作/EP003/ --style '古风电影写实' --verbose")
 
 
@@ -1251,6 +2355,11 @@ def _submit_video_compat(
     run_name: str,
     return_last_frame: bool = False,
     first_frame_url: str | None = None,
+    last_frame_url: str | None = None,
+    ref_videos: list[str] | None = None,
+    ref_audios: list[str] | None = None,
+    generate_audio: bool = True,
+    quality: str | None = None,
 ) -> Any:
     """Submit a video generation request. Returns TaskStatusResponse when wait=True, None otherwise."""
 
@@ -1259,14 +2368,23 @@ def _submit_video_compat(
     encoded_images = [encode_image_to_data_url(p) for p in images]
     asset_urls = [f"asset://{aid}" if not aid.startswith("asset://") else aid for aid in (asset_ids or [])]
     all_image_refs = encoded_images + asset_urls
+
+    resolved_videos = [_resolve_media_ref(v, kind="video") for v in (ref_videos or [])]
+    resolved_audios = [_resolve_media_ref(a, kind="audio") for a in (ref_audios or [])]
+
     req = VideoGenerateRequest(
         model=model or obj.config.video_model,
         prompt=prompt,
         ratio=ratio,
         duration=duration,
         images=all_image_refs,
+        videos=resolved_videos,
+        audios=resolved_audios,
         return_last_frame=return_last_frame,
         first_frame_url=first_frame_url,
+        last_frame_url=last_frame_url,
+        generate_audio=generate_audio,
+        quality=quality,
     )
     client = _build_seedance(obj)
     submitted = client.submit(req)
@@ -1316,6 +2434,10 @@ def _submit_video_compat(
     if last_frame_path:
         out_payload["last_frame_path"] = str(last_frame_path)
         pretty.append(f"尾帧已保存: {last_frame_path}")
+    if result.audio_url:
+        out_payload["audio_url"] = result.audio_url
+    if result.video_duration:
+        out_payload["video_duration"] = result.video_duration
     _emit(obj, out_payload, pretty)
     return result
 

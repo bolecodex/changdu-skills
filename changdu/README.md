@@ -51,11 +51,13 @@ changdu text2image --prompt "江南水乡，水墨画风" --output 水乡.jpg
 # 文生视频
 changdu text2video --prompt "夜景街道，电影感" --ratio 16:9 --duration 15 --wait --output clip.mp4
 
-# 多图参考生视频
+# 多模态参考生视频（图 + 视频 + 音频）
 changdu multimodal2video \
   --image 角色.jpg --image 场景.jpg \
-  --prompt "图1是主角，图2是场景。" \
-  --ratio 16:9 --duration 15 --wait --output clip.mp4
+  --ref-video ./单集制作/EP001/视频_Clip003.mp4 \
+  --voice-asset asset-xxxxxxxx \
+  --prompt "图1是主角，图2是场景。视频1 是上一段尾段，仅作妆造与位置参考。音轨1 锁音色。" \
+  --ratio 16:9 --duration 15 --wait --output clip004.mp4
 
 # 查询任务
 changdu query_result --submit_id <任务ID>
@@ -63,3 +65,19 @@ changdu query_result --submit_id <任务ID>
 # 查看示例
 changdu examples
 ```
+
+## Seedance 2.0 多模态新特性（v0.2 起）
+
+| 能力 | 命令 / 参数 |
+|------|-------------|
+| 参考视频（最多 3 段，每段 ≤15s） | `--ref-video <path/url/asset-id>` |
+| 参考音频（最多 3 段，每段 ≤15s） | `--ref-audio <path/url/asset-id>` |
+| 音色锁定（reference_audio 别名） | `--voice-asset <asset-id>` |
+| 尾帧驱动 | `--last-frame-url <url>` |
+| 禁用同步音频 | `--no-audio` |
+| 指定输出分辨率 | `--quality 480p/720p/1080p` |
+| 抽前段尾段做下一段 reference_video | `changdu clip-extract-tail -i a.mp4 --tail-seconds 5` |
+| 从视频提取音色样本 | `changdu voice-extract -i a.mp4 --start 6 --duration 8` |
+| 一键音色 → TOS → 入库 Audio Asset | `changdu voice-asset-from-clip -i a.mp4 --group-id <组ID>` |
+| 连续生成（默认 ref_video 衔接 + 音色复用） | `changdu sequential-generate --continuity-mode ref_video --voice-asset <id>` |
+| 自动在第 N 段后入库音色，从 N+1 起复用 | `changdu sequential-generate --voice-from-clip 1 --voice-group-id <组ID>` |
