@@ -246,26 +246,17 @@ def _build_concat_filter_complex(
     *,
     crossfade: float = 0.0,
     normalize_audio: bool = False,
-    bgm_enabled: bool = False,
-    bgm_volume: float = 0.25,
-    bgm_ducking: bool = True,
-    bgm_fadein: float = 1.5,
-    bgm_fadeout: float = 2.0,
 ) -> tuple[str, str, str, float]:
-    """Compose a ``filter_complex`` for the upgraded ``clip-concat`` pipeline.
+    """Compose a ``filter_complex`` for the ``clip-concat`` pipeline.
 
     Pipeline (per option):
 
     - ``crossfade>0`` : pairwise ``xfade`` (video) + ``acrossfade`` (audio)
     - ``crossfade==0`` : ``concat`` filter (no transition) — only used when
-      another option (loudnorm/BGM) forces re-encode anyway
+      another option (loudnorm) forces re-encode anyway
     - ``normalize_audio`` : append ``loudnorm=I=-16:LRA=11:TP=-1.5``
-    - ``bgm_enabled`` : split clip audio, fade/volume the BGM, optionally
-      ``sidechaincompress`` (ducking) it by clip audio, then ``amix``
 
     Returns ``(filter_complex, video_label, audio_label, total_duration)``.
-    The ``total_duration`` is the post-crossfade output length, useful for
-    BGM fade-out scheduling outside this helper.
     """
 
     if not durations:
@@ -310,32 +301,6 @@ def _build_concat_filter_complex(
         chains.append(f"{a_label}loudnorm=I=-16:LRA=11:TP=-1.5[anorm]")
         a_label = "[anorm]"
 
-    if bgm_enabled:
-        bgm_idx = n
-        chains.append(f"{a_label}asplit=2[amain][asc]")
-        bgm_filters = [f"volume={bgm_volume:.3f}"]
-        if bgm_fadein > 0:
-            bgm_filters.append(f"afade=t=in:st=0:d={bgm_fadein:.3f}")
-        if bgm_fadeout > 0:
-            fade_out_start = max(0.0, total - bgm_fadeout)
-            bgm_filters.append(
-                f"afade=t=out:st={fade_out_start:.3f}:d={bgm_fadeout:.3f}"
-            )
-        chains.append(f"[{bgm_idx}:a]{','.join(bgm_filters)}[bgmprep]")
-        if bgm_ducking:
-            chains.append(
-                "[bgmprep][asc]sidechaincompress=threshold=0.05:ratio=8:"
-                "attack=200:release=1000[bgmducked]"
-            )
-            chains.append(
-                "[amain][bgmducked]amix=inputs=2:duration=first:dropout_transition=0[afinal]"
-            )
-        else:
-            chains.append(
-                "[amain][bgmprep]amix=inputs=2:duration=first:dropout_transition=0[afinal]"
-            )
-        a_label = "[afinal]"
-
     return ";".join(chains), v_label, a_label, total
 
 
@@ -345,14 +310,9 @@ def _run_concat_with_filters(
     *,
     crossfade: float,
     normalize_audio: bool,
-    bgm: Path | None,
-    bgm_volume: float,
-    bgm_ducking: bool,
-    bgm_fadein: float,
-    bgm_fadeout: float,
     timeout_s: int = 600,
 ) -> tuple[float, str]:
-    """Run the upgraded concat pipeline (re-encode) and return ``(out_duration, ffmpeg_cmd)``."""
+    """Run the concat pipeline (re-encode) and return ``(out_duration, ffmpeg_cmd)``."""
 
     import subprocess
 
@@ -361,18 +321,11 @@ def _run_concat_with_filters(
         durations,
         crossfade=crossfade,
         normalize_audio=normalize_audio,
-        bgm_enabled=bgm is not None,
-        bgm_volume=bgm_volume,
-        bgm_ducking=bgm_ducking,
-        bgm_fadein=bgm_fadein,
-        bgm_fadeout=bgm_fadeout,
     )
 
     cmd: list[str] = ["ffmpeg", "-y"]
     for src in sources:
         cmd.extend(["-i", str(src)])
-    if bgm is not None:
-        cmd.extend(["-i", str(bgm)])
     cmd.extend([
         "-filter_complex", fc,
         "-map", vout,
@@ -470,7 +423,7 @@ def register_compat_commands(app: typer.Typer) -> None:
         first_frame_url: str | None = typer.Option(None, "--first-frame-url", help="指定首帧图片URL（来自上一 clip 的尾帧）。"),
         last_frame_url: str | None = typer.Option(None, "--last-frame-url", help="指定尾帧图片URL（首尾帧驱动）。"),
         ref_video: list[str] = typer.Option([], "--ref-video", help="参考视频（本地路径/URL/asset ID），最多 3 个，用于动作/运镜/外观连贯参考。"),
-        ref_audio: list[str] = typer.Option([], "--ref-audio", help="参考音频（本地路径/URL/asset ID），最多 3 段，用于音色/台词/BGM 锁定。"),
+        ref_audio: list[str] = typer.Option([], "--ref-audio", help="参考音频（本地路径/URL/asset ID），最多 3 段，用于音色/台词锁定。"),
         no_audio: bool = typer.Option(False, "--no-audio", help="禁用同步音频生成。"),
         quality: str | None = typer.Option(None, "--quality", help="视频分辨率：480p/720p/1080p。"),
     ) -> None:
@@ -1025,7 +978,7 @@ def register_compat_commands(app: typer.Typer) -> None:
             clip_label = clip_num.group(0) if clip_num else f"Clip{idx+1:03d}"
             clip_index = int(clip_num.group(1)) if clip_num else (idx + 1)
             clip_prompt = pf.read_text(encoding="utf-8").strip()
-            full_prompt = f"{prompt_header}{clip_prompt}" if prompt_header else clip_prompt
+            full_prompt = f"{prompt_header}\n\n{clip_prompt}" if prompt_header else clip_prompt
             clip_output = out_dir / f"视频_{clip_label}.mp4"
 
             if clip_output.exists() and idx < already_done:
@@ -1150,12 +1103,26 @@ def register_compat_commands(app: typer.Typer) -> None:
 
             all_images = list(image) + extra_ref_images
 
+            has_frame_anchor = bool(ff_url)
+            has_ref_media = bool(all_images or asset or videos_for_this or audios_for_this)
+            if has_frame_anchor and has_ref_media:
+                typer.echo(
+                    f"  注意：first_frame_url 与参考媒体互斥，"
+                    "优先使用 first_frame_url 衔接，清空本次参考媒体（音色由 prompt 文本锚定）"
+                )
+                all_images = []
+                videos_for_this = []
+                audios_for_this = []
+                asset_ids_for_this: list[str] = []
+            else:
+                asset_ids_for_this = list(asset)
+
             try:
                 result = _submit_video_compat(
                     ctx=ctx,
                     prompt=full_prompt,
                     images=all_images,
-                    asset_ids=asset,
+                    asset_ids=asset_ids_for_this,
                     ratio=ratio,
                     duration=duration,
                     model=model,
@@ -1190,8 +1157,8 @@ def register_compat_commands(app: typer.Typer) -> None:
                 if not can_fallback:
                     raise
                 typer.echo(
-                    f"  警告：带 ref_video/ref_audio 的提交被拒（{msg.splitlines()[0][:140]}），"
-                    "降级为 first_frame_url 模式重试（清空 reference_image/video/audio）..."
+                    f"  警告：提交被拒（{msg.splitlines()[0][:140]}），"
+                    "降级为 first_frame_url 模式重试（清空所有参考媒体，音色由 prompt 锚定）..."
                 )
                 result = _submit_video_compat(
                     ctx=ctx,
@@ -1308,7 +1275,7 @@ def register_compat_commands(app: typer.Typer) -> None:
             raise typer.Exit(1)
 
         clip_prompt = prompt_file.read_text(encoding="utf-8").strip()
-        full_prompt = f"{prompt_header}{clip_prompt}" if prompt_header else clip_prompt
+        full_prompt = f"{prompt_header}\n\n{clip_prompt}" if prompt_header else clip_prompt
         clip_output = output or (prompt_dir / f"视频_{clip_label}.mp4")
 
         typer.echo(f"正在重新生成 {clip_label} ...")
@@ -1422,7 +1389,7 @@ def register_compat_commands(app: typer.Typer) -> None:
                 if prev_prompt_file.exists():
                     typer.echo(f"先重新生成 {prev_label} 以获取衔接素材 ...")
                     prev_prompt = prev_prompt_file.read_text(encoding="utf-8").strip()
-                    prev_full = f"{prompt_header}{prev_prompt}" if prompt_header else prev_prompt
+                    prev_full = f"{prompt_header}\n\n{prev_prompt}" if prompt_header else prev_prompt
                     prev_output = out_dir / f"视频_{prev_label}.mp4"
                     prev_result = _submit_video_compat(
                         ctx=ctx, prompt=prev_full, images=list(image),
@@ -1448,7 +1415,7 @@ def register_compat_commands(app: typer.Typer) -> None:
             clip_label = f"Clip{cn:03d}"
             prompt_file = prompt_dir / f"视频_{clip_label}.prompt.txt"
             clip_prompt = prompt_file.read_text(encoding="utf-8").strip()
-            full_prompt = f"{prompt_header}{clip_prompt}" if prompt_header else clip_prompt
+            full_prompt = f"{prompt_header}\n\n{clip_prompt}" if prompt_header else clip_prompt
             clip_output = out_dir / f"视频_{clip_label}.mp4"
 
             typer.echo(f"\n{'='*50}")
@@ -1561,8 +1528,8 @@ def register_compat_commands(app: typer.Typer) -> None:
     @app.command(
         "clip-concat",
         help=(
-            "拼接 clip 为完整视频。默认 stream copy；启用任一高级选项时切换到 "
-            "filter_complex 重编码（xfade + acrossfade + loudnorm + BGM 叠加 + sidechain ducking）。"
+            "拼接 clip 为完整视频。默认 stream copy；启用 --crossfade-seconds 或 --normalize-audio 时切换到 "
+            "filter_complex 重编码。使用 --strip-audio 可移除所有音频轨道。"
         ),
     )
     def clip_concat(
@@ -1580,15 +1547,16 @@ def register_compat_commands(app: typer.Typer) -> None:
             "--normalize-audio/--no-normalize-audio",
             help="启用 loudnorm (I=-16 LRA=11 TP=-1.5)，统一段间音量。",
         ),
-        bgm: Path | None = typer.Option(None, "--bgm", help="BGM 音频文件路径（mp3/wav/m4a），叠加为背景音乐。"),
-        bgm_volume: float = typer.Option(0.25, "--bgm-volume", help="BGM 音量增益（0-1）。"),
-        bgm_ducking: bool = typer.Option(
-            True,
-            "--bgm-ducking/--no-bgm-ducking",
-            help="人声/动作声出现时自动压低 BGM（sidechaincompress）。",
+        strip_audio: bool = typer.Option(
+            False,
+            "--strip-audio/--no-strip-audio",
+            help="移除所有音频轨道。",
         ),
-        bgm_fadein: float = typer.Option(1.5, "--bgm-fadein", help="BGM 淡入秒数。"),
-        bgm_fadeout: float = typer.Option(2.0, "--bgm-fadeout", help="BGM 淡出秒数。"),
+        audio_fadein: float = typer.Option(
+            0.0,
+            "--audio-fadein",
+            help="每个 clip 音频开头淡入秒数（消除 Seedance 启动底噪，推荐 0.3-0.5）。",
+        ),
     ) -> None:
         import re
         import subprocess
@@ -1601,12 +1569,6 @@ def register_compat_commands(app: typer.Typer) -> None:
         if not clips:
             typer.echo(f"错误：在 {input_dir} 中未找到 视频_ClipXXX.mp4 文件。", err=True)
             raise typer.Exit(1)
-
-        if bgm is not None:
-            bgm = bgm.resolve()
-            if not bgm.exists():
-                typer.echo(f"错误：BGM 文件不存在 {bgm}", err=True)
-                raise typer.Exit(1)
 
         output = output.resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -1629,24 +1591,51 @@ def register_compat_commands(app: typer.Typer) -> None:
                 else:
                     sources.append(clip.resolve())
 
+            if audio_fadein > 0 and not strip_audio:
+                faded_sources: list[Path] = []
+                for src in sources:
+                    faded = tmp_dir / f"fadein_{src.name}"
+                    fade_cmd = [
+                        "ffmpeg", "-y", "-i", str(src),
+                        "-af", f"afade=t=in:st=0:d={audio_fadein:.3f}",
+                        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                        str(faded),
+                    ]
+                    r = subprocess.run(fade_cmd, capture_output=True, text=True, timeout=120)
+                    if r.returncode != 0:
+                        typer.echo(f"  音频淡入失败 {src.name}: {r.stderr[-150:]}", err=True)
+                        faded_sources.append(src)
+                    else:
+                        faded_sources.append(faded.resolve())
+                sources = faded_sources
+                typer.echo(f"  已对 {len(clips)} 个 clip 添加 {audio_fadein}s 音频淡入")
+
             advanced = (
                 crossfade_seconds > 0
                 or normalize_audio
-                or bgm is not None
             )
 
             if not advanced:
                 filelist = tmp_dir / "concat_list.txt"
                 filelist.write_text("\n".join(f"file '{s}'" for s in sources) + "\n")
-                result = subprocess.run(
-                    ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(filelist), "-c", "copy", str(output)],
-                    capture_output=True, text=True, timeout=300,
-                )
+                cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(filelist)]
+                if strip_audio:
+                    cmd.extend(["-an", "-c:v", "copy"])
+                else:
+                    cmd.extend(["-c", "copy"])
+                cmd.append(str(output))
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
                 if result.returncode != 0:
                     typer.echo(f"拼接失败: {result.stderr[-200:]}", err=True)
                     raise typer.Exit(1)
                 final_dur = _probe_duration(output)
-                typer.echo(f"拼接完成（stream copy）: {output} ({len(clips)} 个 clip, {final_dur:.1f}s)")
+                features_simple = []
+                if strip_audio:
+                    features_simple.append("无音频")
+                if audio_fadein > 0:
+                    features_simple.append(f"音频淡入 {audio_fadein}s")
+                mode_label = " · ".join(features_simple) if features_simple else "stream copy"
+                typer.echo(f"拼接完成（{mode_label}）: {output} ({len(clips)} 个 clip, {final_dur:.1f}s)")
                 return
 
             try:
@@ -1655,11 +1644,6 @@ def register_compat_commands(app: typer.Typer) -> None:
                     output,
                     crossfade=crossfade_seconds,
                     normalize_audio=normalize_audio,
-                    bgm=bgm,
-                    bgm_volume=bgm_volume,
-                    bgm_ducking=bgm_ducking,
-                    bgm_fadein=bgm_fadein,
-                    bgm_fadeout=bgm_fadeout,
                 )
             except RuntimeError as exc:
                 typer.echo(f"拼接失败: {exc}", err=True)
@@ -1670,8 +1654,6 @@ def register_compat_commands(app: typer.Typer) -> None:
                 features.append(f"xfade {crossfade_seconds:.2f}s")
             if normalize_audio:
                 features.append("loudnorm")
-            if bgm is not None:
-                features.append("bgm" + (" + ducking" if bgm_ducking else ""))
             typer.echo(
                 f"拼接完成（重编码 · {' / '.join(features)}）: {output} "
                 f"({len(clips)} 个 clip, {final_dur:.1f}s)"
@@ -1679,69 +1661,6 @@ def register_compat_commands(app: typer.Typer) -> None:
         finally:
             import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    @app.command(
-        "clip-add-bgm",
-        help=(
-            "在已有视频上叠加 BGM（fade + 可选 sidechain ducking + 可选 loudnorm），"
-            "适合 clip-concat 完成后单独换 BGM、不重跑视频。"
-        ),
-    )
-    def clip_add_bgm(
-        ctx: typer.Context,
-        input_file: Path = typer.Option(..., "--input", "-i", help="输入视频文件（mp4）。"),
-        bgm: Path = typer.Option(..., "--bgm", help="BGM 音频文件路径（mp3/wav/m4a）。"),
-        output: Path = typer.Option(..., "--output", "-o", help="输出视频路径。"),
-        bgm_volume: float = typer.Option(0.25, "--bgm-volume", help="BGM 音量（0-1）。"),
-        bgm_ducking: bool = typer.Option(
-            True,
-            "--bgm-ducking/--no-bgm-ducking",
-            help="人声/动作声出现时自动压低 BGM。",
-        ),
-        bgm_fadein: float = typer.Option(1.5, "--bgm-fadein", help="BGM 淡入秒数。"),
-        bgm_fadeout: float = typer.Option(2.0, "--bgm-fadeout", help="BGM 淡出秒数。"),
-        normalize_audio: bool = typer.Option(
-            False,
-            "--normalize-audio/--no-normalize-audio",
-            help="对原视频音轨先做 loudnorm（推荐多段拼接后开）。",
-        ),
-    ) -> None:
-        input_file = input_file.resolve()
-        bgm = bgm.resolve()
-        if not input_file.exists():
-            typer.echo(f"错误：视频文件不存在 {input_file}", err=True)
-            raise typer.Exit(1)
-        if not bgm.exists():
-            typer.echo(f"错误：BGM 文件不存在 {bgm}", err=True)
-            raise typer.Exit(1)
-
-        output = output.resolve()
-        output.parent.mkdir(parents=True, exist_ok=True)
-
-        try:
-            final_dur, _ = _run_concat_with_filters(
-                [input_file],
-                output,
-                crossfade=0.0,
-                normalize_audio=normalize_audio,
-                bgm=bgm,
-                bgm_volume=bgm_volume,
-                bgm_ducking=bgm_ducking,
-                bgm_fadein=bgm_fadein,
-                bgm_fadeout=bgm_fadeout,
-            )
-        except RuntimeError as exc:
-            typer.echo(f"叠加 BGM 失败: {exc}", err=True)
-            raise typer.Exit(1)
-
-        features = ["bgm"]
-        if bgm_ducking:
-            features.append("ducking")
-        if normalize_audio:
-            features.append("loudnorm")
-        typer.echo(
-            f"BGM 叠加完成（{' / '.join(features)}）: {output} ({final_dur:.1f}s)"
-        )
 
     @app.command("clip-trim", help="裁剪单个 clip 的头部或尾部（保留音视频），用于去除叙事泄漏。")
     def clip_trim(
@@ -2044,25 +1963,20 @@ def register_compat_commands(app: typer.Typer) -> None:
             fixes: list[str] = []
             optimized = raw
 
-            # --- Rule 1: Check for constraint blocks ---
-            has_char_anchor = "【角色锚定】" in raw
-            has_prop_lock = "【道具锁定】" in raw
-            has_scene_lock = "【场景锁定】" in raw
-            has_neg_constraint = "【否定约束】" in raw
+            # --- Rule 1: Check for subject definition (Seedance 2.0 Section 二) ---
+            has_subject_def = bool(re.search(r"将.{0,6}图片\d.{0,20}定义为", raw))
+            has_image_ref = bool(re.search(r"图片\d|@图\d", raw))
+            if has_image_ref and not has_subject_def:
+                issues.append("[主体定义] 引用了图片但未使用「将图片N中的X定义为主体」格式 — 模型可能无法准确绑定角色")
 
-            if not has_char_anchor:
-                issues.append("[缺失] 无【角色锚定】块 — 角色外貌可能不一致")
-            if not has_prop_lock:
-                issues.append("[缺失] 无【道具锁定】块 — 道具可能随意变化")
-            if not has_scene_lock:
-                issues.append("[缺失] 无【场景锁定】块 — 场景可能不连贯")
-            if not has_neg_constraint:
-                issues.append("[缺失] 无【否定约束】块 — 易出错细节无防护")
+            # --- Rule 2: Flag precise timestamps (Seedance 2.0 Section 三) ---
+            has_timeline = bool(re.search(r"\(\d+[–\-]\d+\.?\d*\s*s\)", raw))
+            if has_timeline:
+                issues.append("[时间轴] 使用了精确时间标记如(0-3s) — Seedance 2.0对精确时间支持不稳定，建议用自然语言顺序描述（先...紧接着...随后...）")
 
-            # --- Rule 2: Check for timeline structure ---
-            has_timeline = bool(re.search(r"\d+[–\-]\d+\.?\d*\s*s", raw))
-            if not has_timeline:
-                issues.append("[结构] 无时间轴分镜 — 建议用 '0–5s:' 格式拆分动作")
+            # --- Rule 2b: Check for three-view reference mentions ---
+            if "三视图" in raw or "多视图" in raw:
+                issues.append("[参考图] 提到三视图/多视图 — Seedance 2.0明确不建议使用三视图作为人物参考，应使用面部特写+全身照")
 
             # --- Rule 3: Check for abstract emotion words ---
             abstract_words = ["很悲伤", "非常愤怒", "很高兴", "十分紧张", "很害怕", "震撼", "漂亮", "好看"]
@@ -2070,13 +1984,11 @@ def register_compat_commands(app: typer.Typer) -> None:
             if found_abstract:
                 issues.append(f"[抽象词] 发现模糊情绪词: {', '.join(found_abstract)} — 应替换为具体身体信号")
 
-            # --- Rule 4: Check for multiple camera movements in one segment ---
+            # --- Rule 4: Check for too many camera movements overall ---
             cam_words = ["推镜", "拉远", "横移", "摇移", "环绕", "俯拍", "仰拍", "跟拍", "手持"]
-            segments = re.split(r"\d+[–\-]\d+\.?\d*\s*s\s*[:：]", raw)
-            for seg_idx, seg in enumerate(segments[1:], 1):
-                cam_count = sum(1 for w in cam_words if w in seg)
-                if cam_count >= 3:
-                    issues.append(f"[运镜] 第{seg_idx}段含{cam_count}种运镜 — 每段建议只用1种，减少画面抖动")
+            cam_count = sum(1 for w in cam_words if w in raw)
+            if cam_count >= 5:
+                issues.append(f"[运镜] 全文含{cam_count}种运镜指令 — 15秒内建议不超过3种运镜，过多会导致画面抖动")
 
             # --- Rule 5: Check for violent action words ---
             violent_words = ["狂奔", "剧烈翻滚", "大跳", "高速旋转", "疯狂", "猛烈冲刺"]
@@ -2089,17 +2001,23 @@ def register_compat_commands(app: typer.Typer) -> None:
             if not has_scope:
                 issues.append("[范围] 无范围边界声明 — 可能导致叙事泄漏到下一 clip")
 
-            # --- Rule 7: Check for tail markers ---
+            # --- Rule 7: Check for tail markers (Seedance 2.0 V-2, V-3) ---
             has_no_bgm = "不要BGM" in raw or "不要bgm" in raw.lower()
-            has_no_subtitle = "不要字幕" in raw
+            has_no_subtitle = "不要字幕" in raw or "无字幕" in raw
+            has_strong_subtitle = "避免画面生成字幕" in raw or "保持无字幕" in raw
+            has_no_watermark = "不要水印" in raw or "不要logo" in raw
             if not has_no_bgm or not has_no_subtitle:
                 issues.append("[尾标] 缺少 '不要BGM，不要字幕' 尾部约束")
+            if not has_strong_subtitle:
+                issues.append("[字幕] 建议使用更强约束：'保持无字幕，避免画面生成字幕'（Seedance 2.0 FAQ V-2）")
+            if not has_no_watermark:
+                issues.append("[水印] 缺少 '不要水印，不要logo' 约束（Seedance 2.0 FAQ V-3）")
 
             # --- Rule 8: Check for transition words between actions ---
-            transition_phrases = ["借着", "顺势", "紧接着", "随后", "与此同时", "同时"]
+            transition_phrases = ["借着", "顺势", "紧接着", "随后", "与此同时", "同时", "然后", "接着"]
             has_transitions = any(p in raw for p in transition_phrases)
-            if not has_transitions and has_timeline:
-                issues.append("[衔接] 动作间缺少过渡词 — 加入'顺势/借着惯性/紧接着'提升连贯性")
+            if not has_transitions:
+                issues.append("[衔接] 动作间缺少过渡词 — 加入'紧接着/随后/顺势'让模型自然安排节奏（Seedance 2.0推荐）")
 
             # --- Rule 9: Check for ambiguous appearance descriptions ---
             ambiguous_hair = ["束冠短发", "短发束起", "发髻", "束发"]
@@ -2108,38 +2026,75 @@ def register_compat_commands(app: typer.Typer) -> None:
             if found_ambiguous_hair and not has_explicit_hat:
                 issues.append(f"[头饰] 发型描述模糊: {', '.join(found_ambiguous_hair)} — 易导致帽子时有时无穿帮，应明确写'头戴XX帽'或'无帽露发髻'")
 
-            # --- Rule 10: Makeup lock (Seedance 2.0 multimodal) ---
-            has_makeup_lock = "【妆造锁定】" in raw
-            makeup_keywords = ["眼影", "口红", "腮红", "眉形", "美瞳", "假睫毛", "鬓角", "刘海", "盘发"]
-            mentions_makeup = any(k in raw for k in makeup_keywords)
-            if mentions_makeup and not has_makeup_lock:
-                issues.append("[妆造] 文中提到妆容/发型却无【妆造锁定】块 — 强烈建议拆出独立块，避免被淹没")
-            elif not has_makeup_lock and has_char_anchor:
-                issues.append("[妆造] 缺少【妆造锁定】块 — 建议显式锁定五官细节、妆容、发型，使用 ref_video + ref_image 双锚定时尤其重要")
-
-            # --- Rule 11: Voice anchor (Seedance 2.0 multimodal audio) ---
-            has_voice_anchor = "【音色锚定】" in raw
-            mentions_voice = any(k in raw for k in ["开口", "对白", "台词", "说道", "低声", "喊道", "嗓音", "音色", "声音"])
-            if mentions_voice and not has_voice_anchor:
-                issues.append("[音色] 文中含台词/对白却无【音色锚定】块 — 应显式标注 'reference_audio: voice_asset_xxx'，否则音色会随机变化")
-
-            # --- Rule 12: Video reference explanation (Seedance 2.0 multimodal video) ---
-            has_video_ref_block = "【视频参考】" in raw or "【视频参考说明】" in raw
-            mentions_video_ref = any(k in raw for k in ["参考视频", "上一段尾", "前段画面", "ref_video", "reference_video"])
-            if mentions_video_ref and not has_video_ref_block:
+            # --- Rule 10: Check for verbose non-standard meta-tags ---
+            meta_tags = ["【角色锚定】", "【妆造锁定】", "【道具锁定】", "【场景锁定】", "【否定约束】",
+                         "【动作交接】", "【音色锚定】", "【视频参考说明】"]
+            found_tags = [t for t in meta_tags if t in raw]
+            if len(found_tags) >= 4:
                 issues.append(
-                    "[视频参考] 提到了参考视频却无【视频参考说明】块 — 应自然语言说明每段 reference_video 的用途，例如\"视频1 是上一段尾部，保持人物外观与位置连续\""
+                    f"[冗余] 使用了{len(found_tags)}个自定义meta标签 — Seedance 2.0推荐简洁格式：主体定义+运动+环境+运镜+美学，"
+                    "过多标签会增加噪声干扰模型理解"
                 )
 
-            # --- Rule 13: Cross-clip consistency (batch mode) ---
-            if input_dir and len(files) > 1:
-                char_anchor = re.search(r"【角色锚定】(.+?)(?:\n|【)", raw, re.DOTALL)
-                neg_constraint = re.search(r"【否定约束】(.+?)(?:\n|$)", raw, re.DOTALL)
-                if char_anchor and neg_constraint:
-                    anchor_text = char_anchor.group(1)
-                    neg_text = neg_constraint.group(1)
-                    if "帽" in anchor_text and "帽" not in neg_text:
-                        issues.append("[一致性] 角色锚定提到帽子但否定约束未包含帽子约束 — 应加'全程戴帽不摘'")
+            # --- Rule 11: Check for double-dash which breaks Seedance parsing ---
+            if "--" in raw:
+                issues.append("[特殊字符] 包含 '--' — Seedance 2.0不解析该符号之后的内容（FAQ 四）")
+
+            # --- Rule 12: Check for double periods ---
+            if "。。" in raw:
+                issues.append("[格式] 包含重复句号 '。。' — 应修正为单个句号")
+
+            # --- Rule 13: Check character @图片N binding (FAQ: 写成「男生A@图片1」而非「男生A」) ---
+            subject_defs = re.findall(r"定义为(\S+)", raw)
+            for subj in subject_defs:
+                subj_clean = subj.rstrip("。，,.")
+                if subj_clean and len(subj_clean) >= 2:
+                    occurrences = [m.start() for m in re.finditer(re.escape(subj_clean), raw)]
+                    for occ_start in occurrences:
+                        preceding = raw[max(0, occ_start - 10):occ_start]
+                        if "定义为" in preceding:
+                            continue
+                        following = raw[occ_start + len(subj_clean):occ_start + len(subj_clean) + 10]
+                        if not re.match(r"@图片\d|（图片\d）", following):
+                            if not re.match(r"@图\d", following):
+                                issues.append(
+                                    f"[角色绑定] '{subj_clean}' 出现时未跟随 @图片N — "
+                                    "Seedance 2.0要求每次提及角色都用「角色名@图片N」格式（FAQ: 写成「男生A@图片1」而非「男生A」）"
+                                )
+                                break
+
+            # --- Rule 14: Anti-twin check for multi-character scenes (FAQ V-7) ---
+            char_count = len(subject_defs)
+            if char_count >= 2:
+                has_anti_twin = "不要多人同脸" in raw or "不要在同一画面中复制相同人物" in raw or "杜绝双胞胎" in raw
+                if not has_anti_twin:
+                    issues.append(
+                        f"[双胞胎] 检测到{char_count}个主体定义但缺少反双胞胎约束 — "
+                        "多角色场景建议加「视频全程不要在同一画面中复制相同人物，不要多人同脸」（FAQ V-7）"
+                    )
+
+            # --- Rule 15: Voice trait description check (FAQ A-3) ---
+            voice_refs = re.findall(r"采用音频\d的(.{0,20}?)(?:音色|的音色)", raw)
+            for ref_text in voice_refs:
+                ref_stripped = ref_text.strip()
+                if not ref_stripped or ref_stripped in ("", "的"):
+                    issues.append(
+                        "[音色] 「采用音频N的音色」缺少音色特征描述 — "
+                        "建议加具体描述如「采用音频1的低厚温润中年男声的音色」，能显著提升音色准确性（FAQ A-3）"
+                    )
+                    break
+
+            # --- Rule 16: Reference image separation check (FAQ: 参考图分工不明确) ---
+            if "三视图" not in raw:
+                img_def_lines = [line for line in raw.split("\n") if re.search(r"图片\d", line) and "定义为" in line]
+                for line in img_def_lines:
+                    if re.search(r"(场景|背景|环境).{0,10}(角色|人物|主体|定义为)", line) or \
+                       re.search(r"(角色|人物|主体).{0,10}(场景|背景|环境)", line):
+                        issues.append(
+                            "[参考图分工] 同一图片定义中混合了角色与场景 — "
+                            "每张参考图只承担一种职责（面部/全身/场景/道具），禁止混用"
+                        )
+                        break
 
             # --- Apply auto-fixes (only if not check-only) ---
             if not check_only:
@@ -2180,11 +2135,12 @@ def register_compat_commands(app: typer.Typer) -> None:
                         optimized += "\n本段仅展示上述动作，不展示后续剧情。"
                         fixes.append("+ 追加范围边界声明")
 
-                # Fix: Add tail markers if missing
-                if not has_no_bgm or not has_no_subtitle:
-                    if not optimized.rstrip().endswith("不要BGM，不要字幕"):
-                        optimized = optimized.rstrip() + "\n不要BGM，不要字幕"
-                        fixes.append("+ 追加尾部约束")
+                # Fix: Add tail markers if missing (Seedance 2.0 V-2, V-3)
+                tail_line = "保持无字幕，避免画面生成字幕，不要水印，不要logo，不要BGM。"
+                if not has_no_bgm or not has_no_subtitle or not has_no_watermark:
+                    if tail_line not in optimized:
+                        optimized = optimized.rstrip() + "\n" + tail_line
+                        fixes.append("+ 追加Seedance 2.0尾部约束（无字幕/无水印/无BGM）")
 
             total_issues += len(issues)
             total_fixed += len(fixes)
@@ -2336,7 +2292,7 @@ def register_compat_commands(app: typer.Typer) -> None:
         typer.echo("  --output 视频_Clip003_trimmed.mp4 \\")
         typer.echo("  --trim-tail 2.0")
         typer.echo("")
-        typer.echo("【示例15：提示词优化（含妆造/音色/视频参考三条新规则）】")
+        typer.echo("【示例15：提示词优化（含角色绑定/反双胞胎/音色描述/参考图分工检查）】")
         typer.echo("changdu prompt-optimize --dir ./单集制作/EP003/ --check")
         typer.echo("changdu prompt-optimize --dir ./单集制作/EP003/ --style '古风电影写实' --verbose")
 

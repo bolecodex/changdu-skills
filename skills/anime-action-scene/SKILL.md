@@ -1,6 +1,6 @@
 ---
 name: anime-action-scene
-description: 动漫武打短剧（≤30s）专项 prompt 写作与生成工作流。当需要做日漫/国漫风格的短打戏、追逐戏、对决戏，且要求段间动作与镜头无缝衔接时调用。配套使用 changdu sequential-generate（continuity-mode auto）+ clip-concat 升级版（crossfade 0.4s + loudnorm，**默认不叠加外部 BGM**，仅在确实需要纯氛围片时再用 clip-add-bgm）。
+description: 动漫武打短剧（≤30s）专项 prompt 写作与生成工作流。当需要做日漫/国漫风格的短打戏、追逐戏、对决戏，且要求段间动作与镜头无缝衔接时调用。配套使用 changdu sequential-generate（continuity-mode auto）+ clip-concat（--audio-fadein 消除底噪，crossfade + loudnorm 可选）。
 tags: ["anime", "action", "fight", "short-form", "seedance"]
 ---
 
@@ -16,9 +16,9 @@ S 级的 5 个硬指标：
 2. 同一音色（喘息、喊招、低声台词）全程一致
 3. 武打动作首尾相接（前段落地姿态 = 本段起手姿态）
 4. 镜头节奏成立（中景 → 特写 → 中景，不是六段都中景或都特写）
-5. 段间画面与音频零突兀（crossfade + loudnorm，**保留 Seedance 自带的人声/打斗音/环境音**）
+5. 段间画面与音频零突兀（crossfade + loudnorm + audio-fadein，**保留 Seedance 自带的人声/打斗音/环境音**）
 
-> **音频策略说明**：实测合成 / 免费 BGM 与 anime 武打的氛围完全不搭（既盖住了金属碰撞与人声，又稀释了原声张力），因此本 skill **默认不叠加外部 BGM**，只做 crossfade + loudnorm 的清纯后期。如确实需要纯氛围片（无人声、纯音乐），再用 `clip-add-bgm` 单独叠。
+> **音频策略说明**：Seedance 2.0 生成的音频轨在每段开头可能带有启动底噪（嗡嗡声），使用 `--audio-fadein 0.3` 对每段音频开头做淡入即可消除，无需丢弃整个音轨。仅在后期需要全量配音时才使用 `--strip-audio`。
 
 ---
 
@@ -26,7 +26,7 @@ S 级的 5 个硬指标：
 
 - 用户要做"30s 动漫武打/追逐/对决"
 - 用户给的是写实风格但希望"动漫化"（anime / cel-shaded / Japanese animation）
-- 上一次拼接结果不连贯（音色漂、BGM 割裂、动作跳变）
+- 上一次拼接结果不连贯（动作跳变、画面不衔接）
 
 不适用：
 
@@ -77,26 +77,22 @@ S 级的 5 个硬指标：
 每段都用同一个骨架，只换"分镜段"内容：
 
 ```
+将图片1中的黑色皮甲、银边披风、长发束高马尾的女性定义为女主角。图片2为女主角全身参考。将图片3中的蒙面黑袍、红色腰带、露出眼部带血色伤疤的男性定义为反派。图片4为反派全身参考。图片5为场景参考。
+
 【美术风格】日本动漫 / cel-shaded / cinematic anime, 线条干净, 明暗分明,
 有 motion line 与冲击帧, 不是写实质感, 不是 3D 渲染。
-
-【角色锚定】女主角（黑色皮甲 + 银边披风, 双手持单刀, 长发束高马尾）;
-反派（蒙面黑袍 + 红色腰带, 持双弯刀, 露出眼部带血色伤疤）。
-
-【妆造锁定】参考人物三视图（asset:char_woman_*）—— 严格保持脸型/眼形/
-发饰/兵器形态/服装纹样不变。
 
 【动作交接】上一段以 <X 姿态/位置/兵器朝向> 结束 → 本段从该姿态自然延续。
 （C1 写"无前续，从静止对峙开始"。）
 
-【音色锚定】参考第 1 段语音（reference_audio）—— 喊招与喘息保持同一声线。
+【音色锚定】采用音频1的清冽有力青年女声的音色（reference_audio）—— 喊招与喘息保持同一声线。
 
 【镜头语言】<具体运镜：起幅 / 推拉 / 跟随 / 落幅>，<焦段提示：中景/特写>。
 
 【场景与时间】<时间地点光线>，<环境元素>。
 
-【分镜】(0-2s) <动作 1>。(2-4s) <动作 2>。(4-5s) <收束姿态，必须可被下一段接>。
-本段仅展示上述动作，不展示后续剧情。不要BGM，不要字幕。
+【分镜】女主角@图片1 <动作 1>。紧接着反派@图片3 <动作 2>。随后女主角@图片1 <收束姿态，必须可被下一段接>。
+本段仅展示上述动作，不展示后续剧情。视频全程不要在同一画面中复制相同人物，不要多人同脸。保持无字幕，避免画面生成字幕，不要水印，不要logo，不要BGM。
 ```
 
 `asset:char_woman_*` 是占位写法，实际值由 `asset-create` 后填入。
@@ -174,7 +170,39 @@ changdu asset-upload-images --group-id $GROUP_ID \
 
 每段一个文件 `prompts/视频_Clip00{1..6}.prompt.txt`，按上面的 7 块模板填。
 
+### 3.5（可选）生成角色音色参考视频
+
+在生成 clip 之前，先为主角生成一段音色参考视频，后续所有 clip 自动锚定该音色：
+
+```bash
+changdu multimodal2video \
+  --image ./outputs/demo_anime_action/refs/char_woman_swordsman_threeview.jpg \
+  --prompt "日本动漫cel-shaded风格。女剑士缓缓转身展示全身，然后开口喊道{覆刃·斩月}，声音清冽有力。" \
+  --ratio 16:9 --duration 5 --wait \
+  --output ./outputs/demo_anime_action/refs/char_woman_voice_ref.mp4
+
+changdu upload-tos --file ./outputs/demo_anime_action/refs/char_woman_voice_ref.mp4
+```
+
 ### 4. 顺序生成（auto 模式自动 fallback）
+
+**方式 A：使用音色参考视频（推荐）**
+
+```bash
+changdu sequential-generate \
+  --prompt-dir ./outputs/demo_anime_action/prompts \
+  --image ./outputs/demo_anime_action/refs/char_woman_swordsman_threeview.jpg \
+  --image ./outputs/demo_anime_action/refs/char_villain_assassin_threeview.jpg \
+  --image ./outputs/demo_anime_action/refs/scene_bamboo_snow_night.jpg \
+  --ref-audio <女主_voice_ref_TOS_URL> \
+  --duration 5 \
+  --continuity-mode auto \
+  --output-dir ./outputs/demo_anime_action/clips
+```
+
+使用步骤 3.5 生成的音色参考视频 TOS URL，每个 clip 都会自动附加该音频作为 `reference_audio`。即使 `auto` 模式触发 fallback（降级为 first_frame_url），音色锚定仍然保留。
+
+**方式 B：从第 1 段自动提取音色（传统方式）**
 
 ```bash
 changdu sequential-generate \
@@ -189,31 +217,18 @@ changdu sequential-generate \
   --output-dir ./outputs/demo_anime_action/clips
 ```
 
-`auto` 模式：第 2-6 段先尝试 ref_video 衔接，被挡（content moderation / mutual exclusion）时自动 fallback first_frame_url。`voice-from-clip 1` 从 C1 抽 6-12s 音色样本，asset 入库失败时回退 TOS URL（详见 `voice-asset-from-clip` 三层 fallback）。
+`voice-from-clip 1` 从 C1 抽 6-12s 音色样本，asset 入库失败时回退 TOS URL。缺点：C1 的音色质量不确定，且 fallback 模式下音色锚定可能丢失。
 
-### 5. 拼接 + crossfade + loudnorm（默认不叠 BGM）
+### 5. 拼接（保留原声 + 消除底噪）
 
 ```bash
 changdu clip-concat \
   --input-dir ./outputs/demo_anime_action/clips \
   --output ./outputs/demo_anime_action/final.mp4 \
-  --crossfade-seconds 0.4 \
-  --normalize-audio
+  --audio-fadein 0.3
 ```
 
-只用 Seedance 自动生成的人声 + 打斗音 + 环境音；crossfade 0.4s 让段间画面/音频平滑过渡，loudnorm 统一段间响度（防止某段突然变响）。
-
-如果（且仅如果）确实需要纯氛围片（如做高燃 MV），可在拼完后单独叠 BGM：
-
-```bash
-changdu clip-add-bgm \
-  --input ./outputs/demo_anime_action/final.mp4 \
-  --bgm ./your_authorized_bgm.mp3 \
-  --output ./outputs/demo_anime_action/final_with_bgm.mp4 \
-  --bgm-volume 0.22 --bgm-ducking --normalize-audio
-```
-
-详细原理见 [`video-postproduction/SKILL.md`](../video-postproduction/SKILL.md)。
+`--audio-fadein 0.3` 对每段音频开头做 0.3 秒淡入，消除 Seedance 启动底噪，同时保留喊招、打斗音效和环境音。仅在后期需要全量配音时才使用 `--strip-audio`。
 
 ---
 
@@ -237,11 +252,11 @@ changdu clip-add-bgm \
 
 **修复**：必须写出"上一段末的具体姿态"和"本段起手的具体姿态"，且两者衔接合理（不能上一段刚劈下来本段又抬手起势）。
 
-### 踩坑 4: 叠了 BGM 后反而比"裸拼"难听
+### 踩坑 4: 每段衔接处有嗡嗡底噪
 
-**原因**：BGM 与 anime 武打的金属碰撞声、人声台词在频段上严重打架；ducking 阈值即使再调，也救不了"风格不搭"的根本问题。
+**原因**：Seedance 2.0 生成的音频轨在每段开头带有启动底噪，拼接后在衔接处尤为明显。
 
-**修复**：**默认就别叠 BGM**。Seedance 2.0 已经为每段自动生成了氛围音（环境 + 打斗 + 人声），`crossfade 0.4s + loudnorm` 后整段的连贯性已经够 S 级。如果导演坚持要 BGM，至少先单独导出"裸版"做 A/B 听感对比，再决定。
+**修复**：使用 `changdu clip-concat --audio-fadein 0.3` 对每段音频开头做淡入处理，消除底噪同时保留原声。仅在后期需要全量配音时才使用 `--strip-audio`。
 
 ### 踩坑 5: 写实风格的段被审核挡
 
@@ -251,27 +266,10 @@ changdu clip-add-bgm \
 
 ---
 
-## 何时才考虑叠 BGM（非默认）
-
-只有当 6 段视频里几乎没有人声台词、且想做成"纯氛围片 / 概念短片 / OP-style 片头"时，才考虑叠 BGM。否则保持 Seedance 自带音轨：
-
-- 武打类：金属碰撞 + 喘息 + 喊招才是张力来源，BGM 一加全废
-- 对话类：BGM 抢人声，更别叠
-- 风景空镜：可以叠（无人声、无打斗音）
-
-如要叠：
-
-- 风格匹配 > 一切（日式 taiko / 三味线给古风武侠，cinematic percussion 给西式动作大片）
-- `--bgm-volume` 严格控制在 0.18-0.25
-- 必开 `--bgm-ducking`
-- 优先用授权曲（pixabay CC0、freesound CC-BY、自制 / AI 音乐生成有授权）
-
----
-
 ## 与其他 skills 的关系
 
-- 上游：[`character-design`](../character-design/SKILL.md) 提供角色三视图标准
-- 上游：[`storyboard-to-seedance-prompt`](../storyboard-to-seedance-prompt/SKILL.md) 提供 prompt 7 块结构
+- 上游：[`character-design`](../character-design/SKILL.md) 提供角色设计标准
+- 上游：[`storyboard-to-seedance-prompt`](../storyboard-to-seedance-prompt/SKILL.md) 提供 prompt 结构
 - 同级：[`generate-video-by-seedance`](../generate-video-by-seedance/SKILL.md) 提供 API 限制与多模态字段
-- 下游：[`video-postproduction`](../video-postproduction/SKILL.md) 提供 crossfade / loudnorm / 可选 BGM 后期细节
+- 下游：[`video-postproduction`](../video-postproduction/SKILL.md) 提供 crossfade / loudnorm 后期细节
 - 旁路：[`asset-management`](../asset-management/SKILL.md) 提供资产组与音色 asset 复用
