@@ -4,11 +4,29 @@
 
 ## 一键安装
 
+### ArkClaw / Gitee（推荐）
+
+> 该命令在你把 GitHub 仓库导入到 `gitee.com/bolecodex/changdu-skills` 后可用。
+
+```bash
+bash <(curl -fsSL https://gitee.com/bolecodex/changdu-skills/raw/main/scripts/setup-gitee.sh)
+```
+
+安装完成后，skills 会被写入 `~/.agents/skills/`，`changdu` CLI 会从 Gitee 仓库安装。
+
+### GitHub / npm skills
+
 ```bash
 npx skills add bolecodex/changdu-skills -y -g
 ```
 
 安装完成后，skills 会被写入 `~/.agents/skills/`。
+
+也可以直接运行 GitHub 安装脚本：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/bolecodex/changdu-skills/main/scripts/setup.sh)
+```
 
 ## 安装 changdu CLI
 
@@ -24,20 +42,47 @@ cd changdu-skills/changdu
 pip install .
 ```
 
-或者运行仓库自带的一键安装脚本：
+从 Gitee 安装（导入 Gitee 后可用）：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/bolecodex/changdu-skills/main/scripts/setup.sh)
+pip install "changdu @ git+https://gitee.com/bolecodex/changdu-skills.git#subdirectory=changdu"
 ```
 
 ## 配置
 
-```bash
-export CHANGDU_ARK_API_KEY="你的火山方舟API Key"
+推荐复制 `.env.example`：
 
-# 可选：指定端点
-export CHANGDU_SEEDREAM_ENDPOINT="ep-m-xxxxx"    # 图像端点
-export CHANGDU_SEEDANCE_ENDPOINT="ep-m-xxxxx"    # 视频端点
+```bash
+cp .env.example .env
+```
+
+`.env` 示例：
+
+```bash
+# 必填：火山方舟 Ark API Key
+CHANGDU_ARK_API_KEY=你的火山方舟APIKey
+# 备用变量名（二者设其一即可）
+# ARK_API_KEY=你的火山方舟APIKey
+
+# 可选：模型端点（不设置则使用默认公共模型 ID）
+CHANGDU_SEED_TEXT_ENDPOINT=你的文本端点ID
+CHANGDU_SEEDREAM_ENDPOINT=你的图像端点ID
+CHANGDU_SEEDANCE_ENDPOINT=你的视频端点ID
+
+# 可选：TOS 对象存储
+# 当你传入本地视频/音频作为 reference_video / reference_audio，
+# 或使用 changdu upload / asset-create --file 时需要。
+VOLC_ACCESSKEY=你的火山引擎AccessKey
+VOLC_SECRETKEY=你的火山引擎SecretKey
+CHANGDU_TOS_BUCKET=你的TOS桶名
+CHANGDU_TOS_ENDPOINT=tos-cn-beijing.volces.com
+CHANGDU_TOS_REGION=cn-beijing
+```
+
+如果是在普通 shell 中直接运行 `changdu`，可先加载 `.env`：
+
+```bash
+set -a; source .env; set +a
 ```
 
 ## 快速体验
@@ -56,6 +101,26 @@ changdu multimodal2video \
   --voice-asset asset-xxxxxxxx \
   --prompt "图1是主角，图2是场景。视频1 是上一段尾段，仅做妆造与位置参考。音轨1 锁音色。主角在场景中行走。" \
   --ratio 16:9 --duration 15 --wait --output clip004.mp4
+```
+
+## 在 ArkClaw / Codex 中调用技能
+
+安装后可以直接用自然语言点名技能，ArkClaw/Codex 会读取 `~/.agents/skills/` 下的 `SKILL.md`：
+
+```text
+请使用 generate-image-by-seedream 技能，生成一张 16:9 的江南水乡电影概念图，保存到 outputs/water-town.jpg。
+```
+
+```text
+请使用 generate-video-by-seedance 技能，把这个 prompt 生成 5 秒 16:9 视频，并等待任务完成：夜晚街道，霓虹灯倒映在湿润地面，电影感推镜。
+```
+
+```text
+请使用 novel-to-video 技能，把 docs/【剧本】给植物人老公留种后，他气醒了_episodes_all.txt 拆成角色、场景、文字分镜和 Seedance prompt，先产出 EP001 的制作目录。
+```
+
+```text
+请使用 video-postproduction 技能，把 outputs/demo_anime_action/clips 里的视频拼接成 final.mp4，使用 0.4 秒 crossfade 和 loudnorm。
 ```
 
 ## 端到端示例：3-clip 连贯生成 + 音色锁定
@@ -193,6 +258,8 @@ changdu clip-add-bgm \
 
 ## 仓库结构
 
+更完整的项目职责边界、源码地图、测试状态和维护建议见 [`docs/PROJECT_OVERVIEW.md`](docs/PROJECT_OVERVIEW.md)。
+
 ```
 changdu-skills/
 ├── changdu/              # changdu CLI 源码（Python）
@@ -202,8 +269,11 @@ changdu-skills/
 │   ├── jimeng-skill/
 │   ├── novel-to-video/
 │   └── ...
+├── docs/                 # 提示词指南、剧本文档、项目总览
+├── examples/             # 可运行 demo 与 prompt 模板
 ├── scripts/
 │   └── setup.sh          # 一键安装脚本
+├── outputs/              # 本地生成产物（已 gitignore）
 └── README.md
 ```
 

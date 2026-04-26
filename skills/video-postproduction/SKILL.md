@@ -106,6 +106,7 @@ changdu clip-concat ... --normalize-audio
 | 仅做 crossfade | 偶用 | `changdu clip-concat -d clips -o final.mp4 --crossfade-seconds 0.4` |
 | 完全去除音频（后期配音） | 后期全量配音时 | `changdu clip-concat -d clips -o final.mp4 --strip-audio` |
 | 默认快速拼接（stream copy） | 调试 | `changdu clip-concat -d clips -o final.mp4` |
+| 单独叠加 BGM | 确实需要氛围音乐时 | `changdu clip-add-bgm -i final.mp4 --bgm bgm.mp3 -o final_with_bgm.mp4 --bgm-volume 0.22 --bgm-ducking --normalize-audio` |
 
 ---
 
@@ -139,4 +140,4 @@ changdu clip-concat ... --normalize-audio
 
 - 上游：[`anime-action-scene`](../anime-action-scene/SKILL.md) / [`storyboard-to-seedance-prompt`](../storyboard-to-seedance-prompt/SKILL.md) 产出多段 clip 后调用本 skill
 - 旁路：[`ffmpeg-video-processing`](../ffmpeg-video-processing/SKILL.md) 通用 ffmpeg 命令参考
-- 配套 CLI：`changdu clip-concat`、`changdu clip-trim`
+- 配套 CLI：`changdu clip-concat`、`changdu clip-add-bgm`、`changdu clip-trim`

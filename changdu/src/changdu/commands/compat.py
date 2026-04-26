@@ -246,6 +246,11 @@ def _build_concat_filter_complex(
     *,
     crossfade: float = 0.0,
     normalize_audio: bool = False,
+    bgm_enabled: bool = False,
+    bgm_volume: float = 0.25,
+    bgm_ducking: bool = False,
+    bgm_fadein: float = 0.0,
+    bgm_fadeout: float = 0.0,
 ) -> tuple[str, str, str, float]:
     """Compose a ``filter_complex`` for the ``clip-concat`` pipeline.
 
@@ -255,6 +260,7 @@ def _build_concat_filter_complex(
     - ``crossfade==0`` : ``concat`` filter (no transition) — only used when
       another option (loudnorm) forces re-encode anyway
     - ``normalize_audio`` : append ``loudnorm=I=-16:LRA=11:TP=-1.5``
+    - ``bgm_enabled`` : mix an extra BGM audio input after all clip inputs
 
     Returns ``(filter_complex, video_label, audio_label, total_duration)``.
     """
@@ -301,6 +307,27 @@ def _build_concat_filter_complex(
         chains.append(f"{a_label}loudnorm=I=-16:LRA=11:TP=-1.5[anorm]")
         a_label = "[anorm]"
 
+    if bgm_enabled:
+        bgm_input_index = n
+        bgm_filters = [
+            f"volume={bgm_volume:.3f}",
+            f"atrim=0:{total:.3f}",
+            "asetpts=PTS-STARTPTS",
+        ]
+        if bgm_fadein > 0:
+            bgm_filters.append(f"afade=t=in:st=0:d={bgm_fadein:.3f}")
+        if bgm_fadeout > 0:
+            fade_out_start = max(total - bgm_fadeout, 0.0)
+            bgm_filters.append(f"afade=t=out:st={fade_out_start:.3f}:d={bgm_fadeout:.3f}")
+        chains.append(f"[{bgm_input_index}:a]{','.join(bgm_filters)}[bgm]")
+        if bgm_ducking:
+            chains.append(f"{a_label}asplit=2[amain][asc]")
+            chains.append("[bgm][asc]sidechaincompress=threshold=0.05:ratio=8[bgmduck]")
+            chains.append("[amain][bgmduck]amix=inputs=2:duration=first:dropout_transition=0[afinal]")
+        else:
+            chains.append(f"{a_label}[bgm]amix=inputs=2:duration=first:dropout_transition=0[afinal]")
+        a_label = "[afinal]"
+
     return ";".join(chains), v_label, a_label, total
 
 
@@ -310,6 +337,11 @@ def _run_concat_with_filters(
     *,
     crossfade: float,
     normalize_audio: bool,
+    bgm: Path | None = None,
+    bgm_volume: float = 0.25,
+    bgm_ducking: bool = False,
+    bgm_fadein: float = 0.0,
+    bgm_fadeout: float = 0.0,
     timeout_s: int = 600,
 ) -> tuple[float, str]:
     """Run the concat pipeline (re-encode) and return ``(out_duration, ffmpeg_cmd)``."""
@@ -321,11 +353,18 @@ def _run_concat_with_filters(
         durations,
         crossfade=crossfade,
         normalize_audio=normalize_audio,
+        bgm_enabled=bgm is not None,
+        bgm_volume=bgm_volume,
+        bgm_ducking=bgm_ducking,
+        bgm_fadein=bgm_fadein,
+        bgm_fadeout=bgm_fadeout,
     )
 
     cmd: list[str] = ["ffmpeg", "-y"]
     for src in sources:
         cmd.extend(["-i", str(src)])
+    if bgm is not None:
+        cmd.extend(["-stream_loop", "-1", "-i", str(bgm)])
     cmd.extend([
         "-filter_complex", fc,
         "-map", vout,
@@ -1661,6 +1700,63 @@ def register_compat_commands(app: typer.Typer) -> None:
         finally:
             import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    @app.command("clip-add-bgm", help="给单个视频叠加 BGM，可选 sidechain ducking 与 loudnorm。")
+    def clip_add_bgm(
+        ctx: typer.Context,
+        input_file: Path = typer.Option(..., "--input", "-i", help="输入视频文件。"),
+        bgm: Path = typer.Option(..., "--bgm", help="BGM 音频文件。"),
+        output: Path = typer.Option(..., "--output", "-o", help="输出视频文件。"),
+        bgm_volume: float = typer.Option(0.25, "--bgm-volume", help="BGM 音量倍率。"),
+        bgm_ducking: bool = typer.Option(
+            False,
+            "--bgm-ducking/--no-bgm-ducking",
+            help="启用 sidechain ducking：有人声/原声时自动压低 BGM。",
+        ),
+        normalize_audio: bool = typer.Option(
+            False,
+            "--normalize-audio/--no-normalize-audio",
+            help="混音前对原视频音频启用 loudnorm。",
+        ),
+        bgm_fadein: float = typer.Option(1.0, "--bgm-fadein", help="BGM 淡入秒数。"),
+        bgm_fadeout: float = typer.Option(2.0, "--bgm-fadeout", help="BGM 淡出秒数。"),
+    ) -> None:
+        input_file = input_file.resolve()
+        bgm = bgm.resolve()
+        output = output.resolve()
+        if not input_file.exists():
+            typer.echo(f"错误：文件不存在 {input_file}", err=True)
+            raise typer.Exit(1)
+        if not bgm.exists():
+            typer.echo(f"错误：BGM 文件不存在 {bgm}", err=True)
+            raise typer.Exit(1)
+
+        output.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            final_dur, _ = _run_concat_with_filters(
+                [input_file],
+                output,
+                crossfade=0.0,
+                normalize_audio=normalize_audio,
+                bgm=bgm,
+                bgm_volume=bgm_volume,
+                bgm_ducking=bgm_ducking,
+                bgm_fadein=bgm_fadein,
+                bgm_fadeout=bgm_fadeout,
+            )
+        except RuntimeError as exc:
+            typer.echo(f"叠加 BGM 失败: {exc}", err=True)
+            raise typer.Exit(1)
+
+        features = [f"BGM volume {bgm_volume:.2f}"]
+        if bgm_ducking:
+            features.append("ducking")
+        if normalize_audio:
+            features.append("loudnorm")
+        typer.echo(
+            f"叠加 BGM 完成（{' / '.join(features)}）: {output} "
+            f"({final_dur:.1f}s)"
+        )
 
     @app.command("clip-trim", help="裁剪单个 clip 的头部或尾部（保留音视频），用于去除叙事泄漏。")
     def clip_trim(
