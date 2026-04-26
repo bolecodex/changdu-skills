@@ -50,9 +50,21 @@ pip install "changdu @ git+https://gitee.com/bolecodex/changdu-skills.git#subdir
 
 ## 配置
 
-### ArkClaw 中 `.env` 放在哪里
+### 安装后让 AI 告诉你 `.env` 放在哪里
 
-在 ArkClaw 环境里，`.env` 应该放在**当前项目/工作区根目录**，也就是你让 ArkClaw/Codex 运行 `changdu` 命令时所在的目录。
+安装 skills 和 `changdu` CLI 后，回到 ArkClaw/Codex 的项目会话里，把下面这句话发给 AI：
+
+```text
+请先确认当前工作区根目录的绝对路径，然后告诉我 changdu-skills 的 .env 应该放在哪里；如果还没有 .env，请基于 changdu-skills 的 .env.example 在正确位置创建一份。
+```
+
+AI 应该告诉你一个具体路径，例如：
+
+```text
+/你的ArkClaw项目/.env
+```
+
+原则上，`.env` 应该放在**当前项目/工作区根目录**，也就是 AI 实际运行 `changdu` 命令时所在的目录。
 
 典型结构：
 
@@ -67,7 +79,7 @@ pip install "changdu @ git+https://gitee.com/bolecodex/changdu-skills.git#subdir
 
 不要把 `.env` 放到 `~/.agents/skills/`、`skills/`、`scripts/` 或安装脚本目录里；这些目录只放技能定义和安装文件，`changdu` 运行时不会自动从那里读取配置。
 
-如果你是在 `changdu-skills` 仓库内直接跑 demo，也可以把 `.env` 放在本仓库根目录：
+如果你是在 `changdu-skills` 仓库内直接跑 demo，AI 会告诉你把 `.env` 放在本仓库根目录。也可以手动执行：
 
 ```bash
 cp .env.example .env
@@ -103,7 +115,7 @@ cd 你的ArkClaw项目
 set -a; source .env; set +a
 ```
 
-在 ArkClaw/Codex 中使用技能时，也可以在任务里明确要求“先加载当前项目根目录的 `.env`，再执行 changdu 命令”。如果 ArkClaw 提供环境变量/Secrets 面板，也可以把同样的变量配置在那里；这种方式等价于加载 `.env`。
+在 ArkClaw/Codex 中使用技能时，可以在任务里明确要求“先确认并加载当前项目根目录的 `.env`，再执行 changdu 命令”。如果 ArkClaw 提供环境变量/Secrets 面板，也可以把同样的变量配置在那里；这种方式等价于加载 `.env`。
 
 ## 快速体验
 

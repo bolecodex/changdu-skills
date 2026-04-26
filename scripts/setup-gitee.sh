@@ -83,15 +83,20 @@ echo "========================================="
 echo ""
 
 if [ -z "${CHANGDU_ARK_API_KEY:-${ARK_API_KEY:-}}" ]; then
-  echo "⚠️  未检测到 API Key。请在 ArkClaw 环境或项目 .env 中配置："
+  echo "⚠️  未检测到 API Key。安装完成后请回到 ArkClaw/Codex 项目会话，让 AI 告诉你 .env 的正确路径。"
   echo ""
-  echo '  CHANGDU_ARK_API_KEY=你的火山方舟APIKey'
+  echo "把这句话发给 AI："
+  echo '  请先确认当前工作区根目录的绝对路径，然后告诉我 changdu-skills 的 .env 应该放在哪里；如果还没有 .env，请基于 changdu-skills 的 .env.example 在正确位置创建一份。'
   echo ""
 else
   echo "✅ API Key 已配置"
 fi
 
+echo "AI 通常会给出类似这样的路径："
+echo "  /你的ArkClaw项目/.env"
+echo ""
 echo "可选配置："
+echo "  CHANGDU_ARK_API_KEY=你的火山方舟APIKey"
 echo "  CHANGDU_SEEDREAM_ENDPOINT=你的图像端点ID"
 echo "  CHANGDU_SEEDANCE_ENDPOINT=你的视频端点ID"
 echo "  VOLC_ACCESSKEY / VOLC_SECRETKEY / CHANGDU_TOS_BUCKET（本地视频/音频参考上传时需要）"
