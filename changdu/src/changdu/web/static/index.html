@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Changdu Web 制作台</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #202124;
+        --muted: #667085;
+        --line: #d9dee7;
+        --panel: #ffffff;
+        --band: #f5f7fb;
+        --accent: #1d7f6f;
+        --accent-2: #2457a6;
+        --danger: #b42318;
+        --ok: #177245;
+        --shadow: 0 8px 24px rgba(20, 35, 55, 0.08);
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: var(--ink);
+        background: var(--band);
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 18px 28px;
+        border-bottom: 1px solid var(--line);
+        background: #fff;
+        position: sticky;
+        top: 0;
+        z-index: 5;
+      }
+      h1 { margin: 0; font-size: 22px; letter-spacing: 0; }
+      h2 { margin: 0 0 12px; font-size: 16px; letter-spacing: 0; }
+      h3 { margin: 0 0 8px; font-size: 14px; letter-spacing: 0; }
+      button, input, textarea, select { font: inherit; }
+      button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        border: 1px solid var(--line);
+        background: #fff;
+        border-radius: 7px;
+        padding: 8px 11px;
+        cursor: pointer;
+        min-height: 36px;
+      }
+      button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+      button.secondary { background: var(--accent-2); border-color: var(--accent-2); color: #fff; }
+      input, textarea, select {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 8px 10px;
+        background: #fff;
+        color: var(--ink);
+      }
+      textarea { min-height: 250px; resize: vertical; line-height: 1.55; }
+      label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 5px; }
+      main { max-width: 1480px; margin: 0 auto; padding: 22px 28px 36px; }
+      .status-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+      .pill { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 999px; padding: 4px 9px; background: #fff; }
+      .pill.ok { color: var(--ok); border-color: rgba(23, 114, 69, 0.25); }
+      .pill.bad { color: var(--danger); border-color: rgba(180, 35, 24, 0.25); }
+      .grid { display: grid; grid-template-columns: 390px minmax(0, 1fr) 380px; gap: 18px; align-items: start; }
+      .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); padding: 16px; }
+      .stack { display: grid; gap: 14px; }
+      .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+      .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      .clip-list { display: grid; gap: 7px; max-height: 260px; overflow: auto; }
+      .clip-btn { display: flex; justify-content: space-between; align-items: center; text-align: left; border-radius: 7px; padding: 8px 10px; }
+      .clip-btn.active { border-color: var(--accent); color: var(--accent); background: #effaf7; }
+      .muted { color: var(--muted); }
+      .small { font-size: 12px; }
+      .log {
+        height: 260px;
+        overflow: auto;
+        white-space: pre-wrap;
+        background: #151b22;
+        color: #e6edf3;
+        border-radius: 8px;
+        padding: 12px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 12px;
+        line-height: 1.5;
+      }
+      .artifacts { display: grid; gap: 10px; }
+      .artifact { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fff; overflow-wrap: anywhere; }
+      video, img { width: 100%; max-height: 230px; object-fit: contain; background: #eef1f5; border-radius: 6px; margin-top: 8px; }
+      .issue-box { max-height: 180px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fbfcfe; white-space: pre-wrap; }
+      .step-list { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+      .step { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fbfcfe; }
+      @media (max-width: 1180px) { .grid { grid-template-columns: 1fr; } .step-list { grid-template-columns: 1fr 1fr; } }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>Changdu Web 制作台</h1>
+        <div class="muted small">输入剧本，生成分镜 prompt、中间产物、视频片段和最终成片</div>
+      </div>
+      <div id="health" class="status-bar"></div>
+    </header>
+
+    <main class="stack">
+      <section class="step-list">
+        <div class="step"><strong>1. 剧本</strong><div class="muted small">粘贴任意短剧文本</div></div>
+        <div class="step"><strong>2. 中间产物</strong><div class="muted small">生成剧本文件、分镜和 prompt</div></div>
+        <div class="step"><strong>3. Clip</strong><div class="muted small">调用 sequential-generate 批量生成</div></div>
+        <div class="step"><strong>4. 成片</strong><div class="muted small">拼接、淡变、音频标准化</div></div>
+      </section>
+
+      <main class="grid" style="padding:0">
+        <section class="panel stack">
+          <div>
+            <h2>新建制作项目</h2>
+            <label>项目名</label>
+            <input id="projectName" value="我的短剧" />
+          </div>
+          <div class="row">
+            <div><label>保存到</label><input id="outputRoot" value="outputs/web-projects" /></div>
+            <div><label>目标 Clip 数</label><input id="targetClipCount" type="number" value="6" min="1" max="30" /></div>
+          </div>
+          <div><label>视觉风格</label><input id="scriptStyle" value="电影写实" /></div>
+          <div>
+            <label>剧本文本</label>
+            <textarea id="scriptInput" placeholder="粘贴完整剧本。创建后会生成 剧本.txt、中间产物/分镜.md 和 视频_ClipXXX.prompt.txt。"></textarea>
+          </div>
+          <div class="actions">
+            <button id="createFromScript" class="primary">从剧本创建项目</button>
+          </div>
+
+          <div>
+            <h2>打开已有项目</h2>
+            <label>项目 / Prompt 目录</label>
+            <input id="rootInput" placeholder="outputs/web-projects/项目目录 或 任意包含 prompt 的目录" />
+          </div>
+          <div class="actions">
+            <button id="loadProject">加载项目</button>
+            <button id="refreshArtifacts">刷新产物</button>
+          </div>
+
+          <div>
+            <h3>Clips</h3>
+            <div id="clipList" class="clip-list"></div>
+          </div>
+          <div>
+            <h3>Prompt 检查</h3>
+            <div class="actions"><button id="checkPrompts">批量检查</button></div>
+            <div id="issues" class="issue-box small muted">先创建或加载一个项目。</div>
+          </div>
+        </section>
+
+        <section class="panel stack">
+          <div>
+            <h2>Prompt 工作区</h2>
+            <div id="projectMeta" class="muted small">暂无项目。</div>
+            <div id="selectedClip" class="muted small">请选择一个 clip。</div>
+          </div>
+          <textarea id="promptEditor" placeholder="从剧本创建项目后，可以逐段检查和修改生成 prompt。"></textarea>
+          <div class="actions"><button id="savePrompt" class="primary">保存 Prompt</button></div>
+
+          <div>
+            <h2>生成 Clip</h2>
+            <div class="row">
+              <div><label>比例</label><select id="ratio"><option>16:9</option><option>9:16</option><option>1:1</option><option>4:3</option><option>3:4</option></select></div>
+              <div><label>每段时长</label><input id="duration" type="number" value="15" min="1" /></div>
+            </div>
+            <div class="row">
+              <div><label>清晰度</label><select id="quality"><option value="">默认</option><option>480p</option><option>720p</option><option>1080p</option></select></div>
+              <div><label>衔接模式</label><select id="continuity"><option value="auto">auto</option><option value="ref_video">ref_video</option><option value="first_frame">first_frame</option></select></div>
+            </div>
+            <div class="row">
+              <div><label>尾段秒数</label><input id="tailSeconds" type="number" value="5" min="2" max="15" step="0.5" /></div>
+              <div><label>音色 Asset / URL</label><input id="voiceAsset" placeholder="asset-xxx 或 TOS URL" /></div>
+            </div>
+            <div><label>共享图片路径，每行一个</label><textarea id="images" style="min-height:76px"></textarea></div>
+            <div><label>共享 Asset ID，每行一个</label><textarea id="assets" style="min-height:76px"></textarea></div>
+            <div><label>Prompt Header</label><textarea id="promptHeader" style="min-height:90px" placeholder="可放角色、场景、参考图绑定说明。"></textarea></div>
+            <div class="actions">
+              <button id="startGenerate" class="secondary">开始连续生成</button>
+              <label style="display:flex;align-items:center;gap:8px;margin:0;color:var(--ink)"><input id="noAudio" type="checkbox" style="width:auto" />禁用同步音频</label>
+            </div>
+          </div>
+        </section>
+
+        <aside class="panel stack">
+          <div>
+            <h2>拼接成片</h2>
+            <div><label>输出文件</label><input id="concatOutput" value="outputs/web-projects/final.mp4" /></div>
+            <div class="row">
+              <div><label>Crossfade 秒</label><input id="crossfade" type="number" value="0.4" min="0" step="0.1" /></div>
+              <div><label>裁尾秒</label><input id="trimTail" type="number" value="0" min="0" step="0.1" /></div>
+            </div>
+            <div class="row">
+              <div><label>音频淡入秒</label><input id="audioFadein" type="number" value="0.3" min="0" step="0.1" /></div>
+              <div><label>音频</label><select id="audioMode"><option value="normalize">loudnorm</option><option value="keep">保留</option><option value="strip">移除</option></select></div>
+            </div>
+            <div class="actions"><button id="startConcat" class="secondary">拼接成片</button></div>
+          </div>
+
+          <div>
+            <h2>任务日志</h2>
+            <div id="jobState" class="muted small">暂无任务。</div>
+            <pre id="log" class="log"></pre>
+          </div>
+
+          <div>
+            <h2>中间产物与成片</h2>
+            <div id="artifacts" class="artifacts"></div>
+          </div>
+        </aside>
+      </main>
+    </main>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      let project = null;
+      let selected = null;
+      let activeJob = null;
+      let logOffset = 0;
+
+      async function api(path, options = {}) {
+        const res = await fetch(path, { headers: { "Content-Type": "application/json", ...(options.headers || {}) }, ...options });
+        if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+        return res.json();
+      }
+      function lines(id) { return $(id).value.split(/\n+/).map((x) => x.trim()).filter(Boolean); }
+
+      async function loadHealth() {
+        const h = await api("/api/health");
+        $("health").innerHTML = `
+          <span class="pill ${h.config.ok ? "ok" : "bad"}">配置 ${h.config.ok ? "可用" : "缺失"}</span>
+          <span class="pill ${h.tools.ffmpeg ? "ok" : "bad"}">ffmpeg ${h.tools.ffmpeg ? "可用" : "缺失"}</span>
+          <span class="pill">工作区 ${h.workspace}</span>`;
+      }
+
+      async function createFromScript() {
+        const script = $("scriptInput").value.trim();
+        if (!script) throw new Error("请先输入剧本。");
+        project = await api("/api/projects/from-script", {
+          method: "POST",
+          body: JSON.stringify({
+            projectName: $("projectName").value || "未命名短剧",
+            script,
+            outputRoot: $("outputRoot").value || "outputs/web-projects",
+            targetClipCount: Number($("targetClipCount").value || 6),
+            style: $("scriptStyle").value || "电影写实",
+          }),
+        });
+        $("rootInput").value = project.promptDir;
+        $("concatOutput").value = `${project.outputDir}/完整版.mp4`;
+        selected = project.clips[0] || null;
+        renderProject();
+        if (selected) await loadPrompt(selected.label);
+      }
+
+      async function loadProject() {
+        project = await api(`/api/projects?root=${encodeURIComponent($("rootInput").value)}`);
+        $("concatOutput").value = `${project.outputDir}/完整版.mp4`;
+        selected = project.clips[0] || null;
+        renderProject();
+        if (selected) await loadPrompt(selected.label);
+      }
+
+      function renderProject() {
+        $("projectMeta").textContent = project ? `项目目录：${project.promptDir}` : "暂无项目。";
+        $("clipList").innerHTML = project.clips.map((clip) => `
+          <button class="clip-btn ${selected && selected.label === clip.label ? "active" : ""}" data-clip="${clip.label}">
+            <span>${clip.label}</span><span class="small">${clip.status === "done" ? "已生成" : "待生成"}</span>
+          </button>`).join("") || `<div class="muted small">未找到 视频_ClipXXX.prompt.txt</div>`;
+        document.querySelectorAll("[data-clip]").forEach((btn) => {
+          btn.onclick = async () => {
+            selected = project.clips.find((clip) => clip.label === btn.dataset.clip);
+            renderProject();
+            await loadPrompt(selected.label);
+          };
+        });
+        renderArtifacts(project.artifacts);
+      }
+
+      async function loadPrompt(label) {
+        const data = await api(`/api/prompts/${project.id}/${label}`);
+        $("selectedClip").textContent = `${label} · ${data.path}`;
+        $("promptEditor").value = data.text;
+      }
+
+      async function savePrompt() {
+        if (!project || !selected) return;
+        await api(`/api/prompts/${project.id}/${selected.label}`, { method: "PUT", body: JSON.stringify({ text: $("promptEditor").value }) });
+        $("selectedClip").textContent = `${selected.label} · 已保存`;
+      }
+
+      async function checkPrompts() {
+        if (!project) return;
+        $("issues").textContent = "检查中...";
+        const data = await api("/api/prompt-check", { method: "POST", body: JSON.stringify({ promptDir: project.promptDir }) });
+        $("issues").textContent = data.raw || "无输出。";
+      }
+
+      async function startGenerate() {
+        if (!project) return;
+        activeJob = await api("/api/jobs/sequential-generate", {
+          method: "POST",
+          body: JSON.stringify({
+            promptDir: project.promptDir,
+            outputDir: project.outputDir,
+            images: lines("images"),
+            assets: lines("assets"),
+            ratio: $("ratio").value,
+            duration: Number($("duration").value),
+            quality: $("quality").value || null,
+            continuityMode: $("continuity").value,
+            prevTailSeconds: Number($("tailSeconds").value),
+            voiceAsset: $("voiceAsset").value || null,
+            noAudio: $("noAudio").checked,
+            promptHeader: $("promptHeader").value,
+          }),
+        });
+        logOffset = 0;
+        $("log").textContent = "";
+        pollJob();
+      }
+
+      async function startConcat() {
+        if (!project) return;
+        const mode = $("audioMode").value;
+        activeJob = await api("/api/jobs/clip-concat", {
+          method: "POST",
+          body: JSON.stringify({
+            inputDir: project.outputDir,
+            output: $("concatOutput").value,
+            trimTail: Number($("trimTail").value),
+            crossfadeSeconds: Number($("crossfade").value),
+            normalizeAudio: mode === "normalize",
+            stripAudio: mode === "strip",
+            audioFadein: Number($("audioFadein").value),
+          }),
+        });
+        logOffset = 0;
+        $("log").textContent = "";
+        pollJob();
+      }
+
+      async function pollJob() {
+        if (!activeJob) return;
+        const job = await api(`/api/jobs/${activeJob.id}`);
+        const logs = await api(`/api/jobs/${activeJob.id}/logs?offset=${logOffset}`);
+        logOffset = logs.nextOffset;
+        $("jobState").textContent = `${job.type} · ${job.status}${job.exitCode !== null ? " · exit " + job.exitCode : ""}`;
+        $("log").textContent += logs.chunk;
+        $("log").scrollTop = $("log").scrollHeight;
+        if (job.status === "running" || job.status === "queued") {
+          setTimeout(pollJob, 1500);
+        } else if (project) {
+          await reloadCurrentProject();
+        }
+      }
+
+      async function reloadCurrentProject() {
+        if (!project) return;
+        project = await api(`/api/projects?root=${encodeURIComponent(project.promptDir)}`);
+        renderProject();
+      }
+
+      async function refreshArtifacts() {
+        if (!project) return;
+        const data = await api(`/api/artifacts?project_id=${project.id}`);
+        renderArtifacts(data.artifacts);
+      }
+
+      function renderArtifacts(items) {
+        $("artifacts").innerHTML = items.slice(-16).reverse().map((item) => {
+          const preview = item.kind === "video"
+            ? `<video src="${item.url}" controls></video>`
+            : item.kind === "image"
+              ? `<img src="${item.url}" alt="${item.name}" />`
+              : item.kind === "text"
+                ? `<a href="${item.url}" target="_blank">打开文本</a>`
+                : "";
+          return `<div class="artifact"><div class="small"><strong>${item.name}</strong></div><div class="muted small">${item.kind}</div>${preview}</div>`;
+        }).join("") || `<div class="muted small">暂无中间产物或成片。</div>`;
+      }
+
+      $("createFromScript").onclick = () => createFromScript().catch(alert);
+      $("loadProject").onclick = () => loadProject().catch(alert);
+      $("refreshArtifacts").onclick = () => refreshArtifacts().catch(alert);
+      $("savePrompt").onclick = () => savePrompt().catch(alert);
+      $("checkPrompts").onclick = () => checkPrompts().catch(alert);
+      $("startGenerate").onclick = () => startGenerate().catch(alert);
+      $("startConcat").onclick = () => startConcat().catch(alert);
+      loadHealth().catch(() => {});
+    </script>
+  </body>
+</html>

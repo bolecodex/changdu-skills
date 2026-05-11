@@ -17,8 +17,8 @@ from changdu.commands.image import image_app
 from changdu.commands.task import task_app
 from changdu.commands.trajectory import traj_app
 from changdu.commands.video import video_app
-from changdu.config import load_config
-from changdu.errors import ChangduError, ErrorPayload
+from changdu.config import AppConfig, load_config
+from changdu.errors import ChangduError, ConfigError, ErrorPayload
 from changdu.trajectory.store import TrajectoryStore
 
 app = typer.Typer(
@@ -79,7 +79,12 @@ def root(
         overrides["image_model"] = seedream_endpoint
     if seedance_endpoint:
         overrides["video_model"] = seedance_endpoint
-    config = load_config(profile=profile, config_path=config_path, overrides=overrides)
+    try:
+        config = load_config(profile=profile, config_path=config_path, overrides=overrides)
+    except ConfigError:
+        if ctx.invoked_subcommand != "web":
+            raise
+        config = AppConfig(api_key="")
     store = TrajectoryStore(config.trajectory_dir)
     ctx.obj = AppContext(
         config=config,
@@ -99,6 +104,17 @@ app.add_typer(task_app, name="task", hidden=True)
 app.add_typer(traj_app, name="trajectory", hidden=True)
 app.add_typer(batch_app, name="batch", hidden=True)
 register_compat_commands(app)
+
+
+@app.command("web", help="启动本地 Web 制作台。")
+def web(
+    host: str = typer.Option("127.0.0.1", "--host", help="监听地址，默认仅本机访问。"),
+    port: int = typer.Option(7860, "--port", help="监听端口。"),
+    reload: bool = typer.Option(False, "--reload/--no-reload", help="开发模式自动重载。"),
+) -> None:
+    from changdu.web.app import run_web
+
+    run_web(host=host, port=port, reload=reload)
 
 
 def main() -> None:
